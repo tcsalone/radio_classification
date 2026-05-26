@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radio-classifier"
+version = "0.1.0"
+description = "Local terrestrial radio classifier: RTL-SDR + audfprint + YAMNet + faster-whisper + Ollama, with SQLite analytics"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+  "pydantic>=2.0",
+  "faster-whisper>=1.0.0",
+  "datasketch>=1.6.0",
+  "setuptools>=65.0.0,<82",
+]
+
+[project.optional-dependencies]
+acoustic = [
+  "tensorflow>=2.13.0",
+  "tensorflow-hub>=0.14.0",
+]
+gpu = [
+  # CUDA shared libraries needed by CTranslate2 / faster-whisper on WSL2.
+  # The Windows driver can expose the device while these user-space libs are
+  # still missing from the Linux environment.
+  "nvidia-cublas-cu12>=12.0",
+  "nvidia-cudnn-cu12>=9.0",
+]
+fingerprint = [
+  # audfprint is not packaged for pip (PyPI or direct Git).
+  # Install it as an external CLI tool; see README "Install audfprint".
+]
+shazam = [
+  "shazamio>=0.7.0",
+]
+seeding = [
+  "yt-dlp>=2024.1.1",
+  "requests>=2.31.0",
+  "beautifulsoup4>=4.12.0",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+radio-classifier = "radio_classifier.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "network: tests that require outbound network access",
+  "gpu: tests that require an NVIDIA GPU",
+  "slow: tests that take more than a few seconds",
+]
+# webrtcvad still imports pkg_resources (upstream); noise only until they migrate.
+filterwarnings = [
+  "ignore:pkg_resources is deprecated:UserWarning",
+  "ignore:Couldn't find ffmpeg:RuntimeWarning",
+  "ignore:.*audioop.*:DeprecationWarning",
+]

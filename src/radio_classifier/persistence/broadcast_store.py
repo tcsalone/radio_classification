@@ -1,0 +1,209 @@
+"""SQLite persistence (schema v2) for broadcast segments, brands, songs, commercials."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+from radio_classifier.segments.reducer import duration_seconds
+from radio_classifier.segments.types import SegmentTransition
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _default_schema_path() -> Path:
+    return _repo_root() / "db" / "schema.sql"
+
+
+def _ensure_database(db_path: Path, schema_path: Path) -> None:
+    if not schema_path.exists():
+        raise FileNotFoundError(f"Schema file not found: {schema_path}")
+    schema_sql = schema_path.read_text(encoding="utf-8")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(schema_sql)
+        conn.commit()
+
+
+class BroadcastStore:
+    """Single-writer SQLite store for schema v2."""
+
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        schema_path: Path | None = None,
+        use_wal: bool = True,
+    ) -> None:
+        self._db_path = Path(db_path).resolve()
+        self._schema_path = schema_path or _default_schema_path()
+        _ensure_database(self._db_path, self._schema_path)
+        self._conn = sqlite3.connect(self._db_path)
+        self._conn.execute("PRAGMA foreign_keys = ON")
+        if use_wal:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def __enter__(self) -> BroadcastStore:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    def apply_transition(self, t: SegmentTransition) -> int:
+        """Insert one closed segment row. Returns ``broadcast_events.id``."""
+        dur = duration_seconds(t.timestamp_start, t.timestamp_end)
+        cur = self._conn.execute(
+            """
+            INSERT INTO broadcast_events (
+                timestamp_start, timestamp_end, duration,
+                category, song_id, commercial_id, brand_id,
+                artist, track_title, brand_name,
+                transcript_excerpt, confidence
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                t.timestamp_start,
+                t.timestamp_end,
+                dur,
+                t.category.value,
+                t.song_id,
+                t.commercial_id,
+                t.brand_id,
+                t.artist,
+                t.track_title,
+                t.brand_name,
+                t.transcript_excerpt,
+                t.confidence,
+            ),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    # ----------------------------------------------------------------- brands
+    def upsert_brand(self, canonical_name: str, aliases: list[str] | None = None) -> int:
+        """Insert brand if missing, return its id."""
+        row = self._conn.execute(
+            "SELECT id FROM brands WHERE canonical_name = ?",
+            (canonical_name,),
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        cur = self._conn.execute(
+            "INSERT INTO brands (canonical_name, aliases_json) VALUES (?, ?)",
+            (canonical_name, json.dumps(aliases or [])),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def find_brand_by_name(self, canonical_name: str) -> int | None:
+        row = self._conn.execute(
+            "SELECT id FROM brands WHERE canonical_name = ?",
+            (canonical_name,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    # ------------------------------------------------------------------ songs
+    def upsert_song(
+        self,
+        *,
+        artist: str | None,
+        title: str | None,
+        audfprint_track_id: str | None = None,
+        source: str = "audfprint",
+    ) -> int:
+        row = self._conn.execute(
+            "SELECT id FROM songs WHERE artist IS ? AND title IS ? AND source = ?",
+            (artist, title, source),
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        cur = self._conn.execute(
+            """
+            INSERT INTO songs (audfprint_track_id, artist, title, source)
+            VALUES (?, ?, ?, ?)
+            """,
+            (audfprint_track_id, artist, title, source),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    # ------------------------------------------------------------ commercials
+    def find_commercials_for_brand(
+        self,
+        brand_id: int,
+        duration_bucket_seconds: int,
+    ) -> list[tuple[int, str, str]]:
+        """Return ``[(commercial_id, minhash_hex, reference_transcript)]`` candidates."""
+        rows = self._conn.execute(
+            """
+            SELECT id, minhash_hex, reference_transcript
+            FROM commercials
+            WHERE brand_id = ? AND duration_bucket_seconds = ?
+            """,
+            (brand_id, duration_bucket_seconds),
+        ).fetchall()
+        return [(int(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+    def insert_commercial(
+        self,
+        *,
+        brand_id: int,
+        duration_bucket_seconds: int,
+        minhash_hex: str,
+        reference_transcript: str,
+    ) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO commercials (
+                brand_id, duration_bucket_seconds, minhash_hex,
+                reference_transcript, play_count
+            ) VALUES (?, ?, ?, ?, 1)
+            """,
+            (brand_id, duration_bucket_seconds, minhash_hex, reference_transcript),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def increment_commercial_play_count(self, commercial_id: int) -> None:
+        self._conn.execute(
+            "UPDATE commercials SET play_count = play_count + 1 WHERE id = ?",
+            (commercial_id,),
+        )
+        self._conn.commit()
+
+    # --------------------------------------------------------- brand_mentions
+    def insert_brand_mention(
+        self,
+        *,
+        segment_id: int,
+        brand_id: int,
+        mention_type: str,
+        heard_utc: str,
+    ) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO brand_mentions (segment_id, brand_id, mention_type, heard_utc)
+            VALUES (?, ?, ?, ?)
+            """,
+            (segment_id, brand_id, mention_type, heard_utc),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid or 0)
+
+    # ------------------------------------------------------------ schema meta
+    def schema_version(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'",
+        ).fetchone()
+        return str(row[0]) if row else None

@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Runtime SQLite + captured audio + audfprint index + eval corpus
+data/
+
+# Cursor / GSD tooling (operator's choice whether to commit)
+.cursor/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
