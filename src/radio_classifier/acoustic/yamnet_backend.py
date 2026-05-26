@@ -161,13 +161,35 @@ class _YamnetModel:
     other_idx: np.ndarray
 
 
-def _load_yamnet() -> _YamnetModel:
-    # Best-effort: ensure pip-installed CUDA libs are visible to TensorFlow.
-    # When the [gpu] extra is installed this makes YAMNet run on GPU; when it
-    # isn't, the preload is a no-op and TF transparently falls back to CPU.
-    from radio_classifier.gpu import preload_nvidia_libs
+def _configure_tensorflow_devices(*, force_cpu: bool) -> None:
+    """Pick TF devices before hub.load allocates GPU memory.
 
-    preload_nvidia_libs()
+    On 11 GB cards (e.g. RTX 2080 Ti) TensorFlow eagerly reserves ~9 GB for
+    YAMNet, which leaves no room for faster-whisper ``medium.en``. When
+    ``force_cpu`` is set we hide GPUs from TF entirely so Whisper can use CUDA.
+    """
+    import tensorflow as tf  # type: ignore
+
+    if force_cpu:
+        tf.config.set_visible_devices([], "GPU")
+        return
+    for gpu in tf.config.list_physical_devices("GPU"):
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError:
+            # Already configured or GPU in use — best effort.
+            pass
+
+
+def _load_yamnet(*, force_cpu: bool = False) -> _YamnetModel:
+    # Best-effort: ensure pip-installed CUDA libs are visible to TensorFlow.
+    # Skipped when force_cpu — Whisper owns the GPU in that mode.
+    if not force_cpu:
+        from radio_classifier.gpu import preload_nvidia_libs
+
+        preload_nvidia_libs()
+
+    _configure_tensorflow_devices(force_cpu=force_cpu)
 
     import tensorflow_hub as hub  # type: ignore
 
@@ -227,8 +249,9 @@ class YamnetAcousticClassifier:
         *,
         min_prob: float = 0.25,
         speech_bias: bool = True,
+        force_cpu: bool = False,
     ) -> None:
-        self._yam = _load_yamnet()
+        self._yam = _load_yamnet(force_cpu=force_cpu)
         self.min_prob = min_prob
         self.speech_bias = speech_bias
 

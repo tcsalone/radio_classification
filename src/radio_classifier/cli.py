@@ -475,22 +475,8 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
         else:
             tier1 = idx
 
-    tier2 = None
-    if not args.no_tier2:
-        try:
-            from radio_classifier.acoustic import YamnetAcousticClassifier
-
-            tier2 = YamnetAcousticClassifier(
-                min_prob=args.tier2_min_prob,
-                speech_bias=not args.no_tier2_speech_bias,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"radio-classifier: WARNING failed to load YAMNet ({exc}); "
-                "Tier 2 disabled for this run.",
-                file=sys.stderr,
-            )
-
+    # Tier 3 before Tier 2: faster-whisper must claim GPU VRAM first on 11 GB
+    # cards. YAMNet will run on CPU when both tiers are active with CUDA Whisper.
     tier3 = None
     if not args.no_tier3:
         try:
@@ -520,6 +506,30 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
             print(
                 f"radio-classifier: WARNING failed to load Tier 3 ({exc}); "
                 "Tier 3 disabled.",
+                file=sys.stderr,
+            )
+
+    tier2 = None
+    if not args.no_tier2:
+        try:
+            from radio_classifier.acoustic import YamnetAcousticClassifier
+
+            force_yamnet_cpu = tier3 is not None and args.whisper_device == "cuda"
+            if force_yamnet_cpu:
+                print(
+                    "radio-classifier: YAMNet on CPU (Whisper uses CUDA; "
+                    "keeps both tiers within GPU memory on 11 GB cards).",
+                    file=sys.stderr,
+                )
+            tier2 = YamnetAcousticClassifier(
+                min_prob=args.tier2_min_prob,
+                speech_bias=not args.no_tier2_speech_bias,
+                force_cpu=force_yamnet_cpu,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"radio-classifier: WARNING failed to load YAMNet ({exc}); "
+                "Tier 2 disabled for this run.",
                 file=sys.stderr,
             )
 
