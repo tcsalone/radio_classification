@@ -23,11 +23,22 @@ acoustic = [
   "tensorflow-hub>=0.14.0",
 ]
 gpu = [
-  # CUDA shared libraries needed by CTranslate2 / faster-whisper on WSL2.
-  # The Windows driver can expose the device while these user-space libs are
-  # still missing from the Linux environment.
+  # CUDA shared libraries needed on WSL2 by:
+  #   * CTranslate2 / faster-whisper (Tier 3): cudart, cublas, cudnn
+  #   * TensorFlow / YAMNet (Tier 2):          cufft, cusolver, cusparse
+  # The Windows driver exposes the device while these user-space libs are
+  # missing from the Linux environment by default. radio_classifier.gpu
+  # dlopen()s them with RTLD_GLOBAL so both frameworks can resolve them
+  # without LD_LIBRARY_PATH games.
+  "nvidia-cuda-runtime-cu12>=12.0",
   "nvidia-cublas-cu12>=12.0",
   "nvidia-cudnn-cu12>=9.0",
+  "nvidia-cufft-cu12>=11.0",
+  "nvidia-cusolver-cu12>=11.0",
+  "nvidia-cusparse-cu12>=12.0",
+  # nvcc provides libdevice.10.bc which TF/XLA JIT needs at runtime even
+  # though we never call the nvcc compiler ourselves.
+  "nvidia-cuda-nvcc-cu12>=12.0",
 ]
 fingerprint = [
   # audfprint is not packaged for pip (PyPI or direct Git).

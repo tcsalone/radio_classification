@@ -1,23 +1,28 @@
 """Auto-discover and pre-load NVIDIA CUDA shared libraries shipped via pip wheels.
 
-CTranslate2 / faster-whisper need ``libcublas.so.12`` and ``libcudnn.so.*`` at
-runtime. On WSL2 the Windows-side driver makes the device visible but the
-Linux user-space libraries are not installed by default. Operators install the
-``[gpu]`` extra which pulls in:
+Two consumers in this project need CUDA user-space libraries at runtime:
 
-* ``nvidia-cublas-cu12``
-* ``nvidia-cudnn-cu12``
-* ``nvidia-cuda-nvrtc-cu12`` (transitively from cublas)
+* **CTranslate2 / faster-whisper** (Tier 3) needs ``libcublas.so.12``,
+  ``libcudart.so.12`` and ``libcudnn.so.*``.
+* **TensorFlow / YAMNet** (Tier 2) additionally requires ``libcufft.so.11``,
+  ``libcusolver.so.11``, and ``libcusparse.so.12``.
 
-…but those wheels drop their ``.so`` files into
+On WSL2 the Windows-side driver makes the device visible but the Linux
+user-space libraries are not installed by default. Operators install the
+``[gpu]`` extra which pulls in all of the above via the matching
+``nvidia-*-cu12`` wheels.
+
+Those wheels drop their ``.so`` files into
 ``<site-packages>/nvidia/<libname>/lib/`` which is NOT on the dynamic
 linker's search path. Rather than ask operators to set ``LD_LIBRARY_PATH``
 correctly (which is brittle: ``__file__`` on namespace sub-packages can be
 ``None``), this module ``dlopen()``s the libraries with ``RTLD_GLOBAL`` so
-later imports of ``faster_whisper`` / ``ctranslate2`` resolve them.
+later imports of ``faster_whisper`` / ``ctranslate2`` / ``tensorflow``
+resolve them.
 
 Call :func:`preload_nvidia_libs` **before** the first ``WhisperModel(...)``
-construction. It is a no-op when the wheels are not installed.
+construction *and* before the first ``tensorflow``/``tensorflow_hub`` import.
+It is a no-op when the wheels are not installed.
 """
 
 from __future__ import annotations
@@ -31,13 +36,17 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-# Order matters: cublas before cudnn so cudnn can resolve its dependency on
-# cublas through the already-loaded global symbol table.
+# Order matters: cudart and cublas come before cudnn / cufft / cusolver /
+# cusparse so the latter can resolve their dependencies on cublas+cudart
+# through the already-loaded global symbol table.
 _PRELOAD_PACKAGES: tuple[str, ...] = (
     "nvidia.cuda_runtime.lib",
     "nvidia.cublas.lib",
     "nvidia.cuda_nvrtc.lib",
     "nvidia.cudnn.lib",
+    "nvidia.cufft.lib",
+    "nvidia.cusolver.lib",
+    "nvidia.cusparse.lib",
 )
 
 

@@ -162,6 +162,13 @@ class _YamnetModel:
 
 
 def _load_yamnet() -> _YamnetModel:
+    # Best-effort: ensure pip-installed CUDA libs are visible to TensorFlow.
+    # When the [gpu] extra is installed this makes YAMNet run on GPU; when it
+    # isn't, the preload is a no-op and TF transparently falls back to CPU.
+    from radio_classifier.gpu import preload_nvidia_libs
+
+    preload_nvidia_libs()
+
     import tensorflow_hub as hub  # type: ignore
 
     model = hub.load(_YAMNET_HUB_URL)
