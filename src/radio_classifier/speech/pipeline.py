@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from radio_classifier.ingest.windows import AudioWindow
+from radio_classifier.brands import canonicalize_brand
 from radio_classifier.speech.json_schema import speech_kind_from_llm
 from radio_classifier.speech.ollama import OllamaClassificationError, OllamaSpeechClassifier
 from radio_classifier.speech.transcribe import WhisperTranscriber
@@ -65,6 +66,11 @@ def run_speech_pipeline(
             message=str(exc),
         )
     cat, brand, mentions, sig = speech_kind_from_llm(llm)
+    brand = canonicalize_brand(brand)
+    for mention in mentions:
+        normalized = canonicalize_brand(mention.name)
+        if normalized is not None:
+            mention.name = normalized
     post_gate = _classification_quality_message(tr.text, cat.value)
     if post_gate is not None:
         return SpeechPipelineResult(

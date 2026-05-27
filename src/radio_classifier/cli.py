@@ -734,12 +734,15 @@ def _persist_brand_mentions(
     mentions,
     heard_utc: str,
 ) -> None:
+    from radio_classifier.brands import canonicalize_brand
+
     if store is None or event_id <= 0 or not mentions:
         return
     for m in mentions:
-        if not m.name:
+        brand_name = canonicalize_brand(m.name)
+        if brand_name is None:
             continue
-        brand_id = store.upsert_brand(m.name.strip())
+        brand_id = store.upsert_brand(brand_name)
         store.insert_brand_mention(
             segment_id=event_id,
             brand_id=brand_id,

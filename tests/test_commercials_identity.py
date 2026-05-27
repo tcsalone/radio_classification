@@ -112,6 +112,62 @@ def test_resolver_skips_when_brand_missing(tmp_path: Path) -> None:
         store.close()
 
 
+def test_resolver_canonicalizes_known_brand_variants(tmp_path: Path) -> None:
+    resolver, store = _resolver(tmp_path)
+    try:
+        r1 = resolver.resolve(
+            brand="Rolaid",
+            transcript="For fast heartburn relief choose Rolaid tablets today",
+            duration_seconds=20.0,
+            signature=CommercialSignature(
+                key_phrases=["heartburn relief", "Rolaid tablets"],
+                duration_bucket_seconds=20,
+            ),
+        )
+        r2 = resolver.resolve(
+            brand="Rolaids",
+            transcript="For fast heartburn relief choose Rolaids tablets today",
+            duration_seconds=20.0,
+            signature=CommercialSignature(
+                key_phrases=["heartburn relief", "Rolaids tablets"],
+                duration_bucket_seconds=20,
+            ),
+        )
+
+        assert r1.brand_id == r2.brand_id
+        row = store.connection.execute(
+            "SELECT canonical_name FROM brands WHERE id = ?", (r1.brand_id,)
+        ).fetchone()
+        assert row[0] == "Rolaids"
+    finally:
+        store.close()
+
+
+def test_resolver_canonicalizes_graton_resort_variants(tmp_path: Path) -> None:
+    resolver, store = _resolver(tmp_path)
+    try:
+        r1 = resolver.resolve(
+            brand="Creighton Resort and Casino",
+            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
+            duration_seconds=20.0,
+            signature=None,
+        )
+        r2 = resolver.resolve(
+            brand="Greaten Resort and Casino",
+            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
+            duration_seconds=20.0,
+            signature=None,
+        )
+
+        assert r1.brand_id == r2.brand_id
+        row = store.connection.execute(
+            "SELECT canonical_name FROM brands WHERE id = ?", (r1.brand_id,)
+        ).fetchone()
+        assert row[0] == "Graton Resort and Casino"
+    finally:
+        store.close()
+
+
 def test_resolver_skips_short_or_long_segments(tmp_path: Path) -> None:
     resolver, store = _resolver(tmp_path)
     try:

@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from radio_classifier.brands import canonicalize_brand
 from radio_classifier.persistence.broadcast_store import BroadcastStore
 from radio_classifier.segments.normalize import normalize_token
 from radio_classifier.speech.types import CommercialSignature
@@ -150,7 +151,8 @@ class CommercialIdentityResolver:
     ) -> CommercialResolution:
         cfg = self.config
 
-        if not brand or not brand.strip():
+        canonical_brand = canonicalize_brand(brand)
+        if canonical_brand is None:
             return CommercialResolution(
                 commercial_id=None,
                 brand_id=None,
@@ -167,7 +169,6 @@ class CommercialIdentityResolver:
                 reason="skipped_duration",
             )
 
-        canonical_brand = brand.strip()
         brand_id = self.store.upsert_brand(canonical_brand)
 
         bucket = bucket_duration(duration_seconds, bucket=cfg.bucket_seconds)

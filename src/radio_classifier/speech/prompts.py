@@ -41,15 +41,19 @@ Decision tree (apply IN ORDER, stop at the first match):
    commercial_signature=null.
 
 4. STATION — the transcript is a station ID, sweeper, liner ("You're listening
-   to 105.3", "Up next ten in a row", "Now playing"), or a short non-selling
-   jingle. brand=station call letters / name if present.
+   to 105.3", "Up next ten in a row", "Now playing"), artist/venue promo,
+   station voiceover, or short non-selling jingle. Favor STATION for short
+   branded station phrases like "Live 105 presents ...", "keep it on Live 105",
+   "your source for music discovery", or celebrity liners where the only
+   purpose is identifying/promoting the station. brand=station call letters /
+   name if present.
    commercial_signature=null.
 
-5. DJ — DJ banter, song intros, listener interaction, contest gameplay, music
-   commentary, weather chitchat that is NOT a forecast. brand=null UNLESS the
-   DJ explicitly names a sponsor in passing ("this hour brought to you by
-   Toyota") in which case set brand to the sponsor AND add an entry to
-   brand_mentions with type="dj_shoutout".
+5. DJ — human host banter, extended song intros, listener interaction, contest
+   gameplay, music commentary, weather chitchat that is NOT a forecast.
+   brand=null UNLESS the DJ explicitly names a sponsor in passing ("this hour
+   brought to you by Toyota") in which case set brand to the sponsor AND add
+   an entry to brand_mentions with type="dj_shoutout".
 
 brand_mentions: include EVERY brand named in the transcript (including ad
 copy), with type:
@@ -86,6 +90,24 @@ FEW_SHOTS: list[dict[str, str]] = [
             '"brand_mentions":[{"name":"The Edge","type":"tag"}],'
             '"commercial_signature":null,"confidence":0.95,'
             '"rationale":"Station identifier / sweeper."}'
+        ),
+    },
+    {
+        "user": "Mercy is the killer in you. Live 105 presents The Smashing Pumpkins. Keep it on Live 105.",
+        "assistant": (
+            '{"class":"STATION","brand":"Live 105",'
+            '"brand_mentions":[{"name":"Live 105","type":"tag"}],'
+            '"commercial_signature":null,"confidence":0.9,'
+            '"rationale":"Short Live 105 station promo and sweeper, not DJ banter or a paid ad."}'
+        ),
+    },
+    {
+        "user": "Hello, hello, hello. It's me, Anthony Kiedis from the Red Hot Chili Peppers, and you're listening to Live 105.",
+        "assistant": (
+            '{"class":"STATION","brand":"Live 105",'
+            '"brand_mentions":[{"name":"Live 105","type":"tag"}],'
+            '"commercial_signature":null,"confidence":0.9,'
+            '"rationale":"Celebrity station liner identifying Live 105."}'
         ),
     },
     {
