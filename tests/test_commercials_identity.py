@@ -158,8 +158,15 @@ def test_resolver_canonicalizes_graton_resort_variants(tmp_path: Path) -> None:
             duration_seconds=20.0,
             signature=None,
         )
+        r3 = resolver.resolve(
+            brand="Grayton Resort and Casino",
+            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
+            duration_seconds=20.0,
+            signature=None,
+        )
 
         assert r1.brand_id == r2.brand_id
+        assert r1.brand_id == r3.brand_id
         row = store.connection.execute(
             "SELECT canonical_name FROM brands WHERE id = ?", (r1.brand_id,)
         ).fetchone()

@@ -31,10 +31,13 @@ Decision tree (apply IN ORDER, stop at the first match):
 
 2. COMMERCIAL — the speech actively sells a product, service, or brand to the
    listener (call to action, "visit", "buy", "call now", financing offers,
-   sponsor reads). The product/brand goes in "brand". Provide
-   commercial_signature with 2-4 key_phrases capturing the ad's identity
-   (slogan, tagline, distinctive product or claim). duration_bucket_seconds
-   should be the nearest 5-second multiple to the apparent ad length.
+   sponsor reads). This includes DJ-read paid spots, contests presented on
+   behalf of an advertiser, station ad-sales copy ("Advertise with Live 105 at
+   Audacy"), sponsored branded content, and infomercial-style features. The
+   product/brand goes in "brand". Provide commercial_signature with 2-4
+   key_phrases capturing the ad's identity (slogan, tagline, distinctive
+   product or claim). duration_bucket_seconds should be the nearest 5-second
+   multiple to the apparent ad length.
 
 3. PSA_NEWS — public service announcements, civic/safety, traffic, weather,
    news headlines, AMBER alerts. brand may be null or the issuing agency.
@@ -45,15 +48,17 @@ Decision tree (apply IN ORDER, stop at the first match):
    station voiceover, or short non-selling jingle. Favor STATION for short
    branded station phrases like "Live 105 presents ...", "keep it on Live 105",
    "your source for music discovery", or celebrity liners where the only
-   purpose is identifying/promoting the station. brand=station call letters /
-   name if present.
+   purpose is identifying/promoting the station. Do NOT use STATION for copy
+   that sells advertising services or tells listeners to advertise with the
+   station; that is COMMERCIAL. brand=station call letters / name if present.
    commercial_signature=null.
 
 5. DJ — human host banter, extended song intros, listener interaction, contest
    gameplay, music commentary, weather chitchat that is NOT a forecast.
-   brand=null UNLESS the DJ explicitly names a sponsor in passing ("this hour
-   brought to you by Toyota") in which case set brand to the sponsor AND add
-   an entry to brand_mentions with type="dj_shoutout".
+   brand=null UNLESS the DJ explicitly names a sponsor in passing. If the DJ
+   is reading ad copy, giving a call-to-action, promoting a contest for a law
+   firm/casino/car dealer, or telling listeners to visit/call/go online for a
+   sponsor, classify COMMERCIAL instead of DJ.
 
 brand_mentions: include EVERY brand named in the transcript (including ad
 copy), with type:
@@ -117,6 +122,24 @@ FEW_SHOTS: list[dict[str, str]] = [
             '"brand_mentions":[{"name":"Toyota","type":"paid_ad"}],'
             '"commercial_signature":{"key_phrases":["brought to you by Toyota","Toyota lets go places","downtown"],"duration_bucket_seconds":10},'
             '"confidence":0.9,"rationale":"Hour sponsor tag is itself a paid placement."}'
+        ),
+    },
+    {
+        "user": "Enter now to win two hundred and fifty thousand dollars in prizes from Law Tigers. Go to stylin and sturgis dot com.",
+        "assistant": (
+            '{"class":"COMMERCIAL","brand":"Law Tigers",'
+            '"brand_mentions":[{"name":"Law Tigers","type":"paid_ad"}],'
+            '"commercial_signature":{"key_phrases":["250,000 in prizes","Law Tigers","stylin and sturgis"],"duration_bucket_seconds":15},'
+            '"confidence":0.9,"rationale":"DJ-read contest ad with sponsor and call-to-action."}'
+        ),
+    },
+    {
+        "user": "Advertise with Live 105 at Audacy dot com and reach Bay Area decision makers who are tuned in and engaged.",
+        "assistant": (
+            '{"class":"COMMERCIAL","brand":"Live 105",'
+            '"brand_mentions":[{"name":"Live 105","type":"paid_ad"},{"name":"Audacy","type":"tag"}],'
+            '"commercial_signature":{"key_phrases":["advertise with Live 105","Audacy dot com","decision makers"],"duration_bucket_seconds":20},'
+            '"confidence":0.9,"rationale":"Station ad-sales copy selling advertising services."}'
         ),
     },
     {

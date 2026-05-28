@@ -19,6 +19,7 @@ _BRAND_ALIASES: dict[str, str] = {
     normalize_token("Rolaids"): "Rolaids",
     normalize_token("Creighton Resort and Casino"): "Graton Resort and Casino",
     normalize_token("Greaten Resort and Casino"): "Graton Resort and Casino",
+    normalize_token("Grayton Resort and Casino"): "Graton Resort and Casino",
     normalize_token("Graton Resort and Casino"): "Graton Resort and Casino",
 }
 
