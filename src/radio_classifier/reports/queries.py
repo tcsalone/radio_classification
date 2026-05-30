@@ -43,6 +43,25 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def _parse_iso_utc(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _gap_seconds(end_iso: str, next_start_iso: str) -> float:
+    """Wall-clock seconds between ``end_iso`` and ``next_start_iso``.
+
+    Returns 0.0 when the next segment starts before (or at) the previous
+    segment's end (overlapping windows can do this), so overlap is treated as
+    "no gap" for spin merging — never as a negative gap that would force a
+    spurious split.
+    """
+    delta = (_parse_iso_utc(next_start_iso) - _parse_iso_utc(end_iso)).total_seconds()
+    return max(0.0, delta)
+
+
 # ---------------------------------------------------------------------- types
 @dataclass
 class CommercialRow:
@@ -64,11 +83,85 @@ class BrandRow:
 
 @dataclass
 class SongRow:
+    """One song's airtime rollup.
+
+    ``spin_count`` is the number of distinct **plays** of the song, computed
+    by collapsing same-song segments that are separated by less than
+    :data:`SPIN_MERGE_GAP_SECONDS` seconds. This matches radio-industry
+    "spins" terminology: a 4-minute song interrupted by 5 seconds of DJ
+    talkover counts as one spin, not two.
+
+    ``segment_count`` is the raw count of ``broadcast_events`` rows for the
+    song — the metric the report used to call ``play_count``. It is still
+    surfaced because it shows how cleanly the funnel locked onto the song.
+    """
+
     song_id: int | None
     artist: str | None
     title: str | None
-    play_count: int
+    spin_count: int
+    segment_count: int
     total_duration_seconds: float
+
+    # Compatibility alias for older call sites that read ``play_count``.
+    @property
+    def play_count(self) -> int:
+        return self.segment_count
+
+
+SPIN_MERGE_GAP_SECONDS: float = 60.0
+"""Maximum gap between same-song segments that still counts as one spin.
+
+Chosen to be larger than typical Tier 3 / DJ-talkover interruptions but
+much smaller than a station's "song repeats per show" cadence, so two real
+plays of the same track stay separate.
+"""
+
+
+@dataclass
+class ArtistRow:
+    """One artist's airtime rollup across all titles.
+
+    ``spin_count`` is the total number of distinct plays summed across every
+    title the artist had on air. ``distinct_titles`` is how many unique songs
+    contributed to those spins. ``segment_count`` is the raw ``broadcast_events``
+    row count (kept for transparency, same way :class:`SongRow` does).
+    """
+
+    artist: str
+    spin_count: int
+    distinct_titles: int
+    segment_count: int
+    total_duration_seconds: float
+
+
+def _count_spins(
+    segments: list[tuple[str, str | None, float | None]],
+    gap_seconds: float,
+) -> tuple[int, float]:
+    """Walk one song's segments in start-order, return ``(spins, total_airtime)``.
+
+    Consecutive segments separated by less than ``gap_seconds`` of wall-clock
+    silence are folded into the same spin. Overlapping segments (which can
+    happen with the sliding-window classifier) count as zero gap, never as a
+    negative gap that would force a spurious split.
+    """
+    spin_count = 0
+    prev_end_iso: str | None = None
+    total_duration = 0.0
+    for start_iso, end_iso, dur in segments:
+        dur_f = float(dur or 0.0)
+        total_duration += dur_f
+        if prev_end_iso is None or _gap_seconds(prev_end_iso, start_iso) > gap_seconds:
+            spin_count += 1
+        if end_iso is not None:
+            prev_end_iso = end_iso
+        elif dur_f > 0:
+            derived_end = _parse_iso_utc(start_iso) + timedelta(seconds=dur_f)
+            prev_end_iso = _iso(derived_end)
+        else:
+            prev_end_iso = start_iso
+    return spin_count, total_duration
 
 
 @dataclass
@@ -171,32 +264,178 @@ def songs_top(
     *,
     since_utc: str,
     top_n: int = 10,
+    spin_merge_gap_seconds: float | None = None,
 ) -> list[SongRow]:
-    sql = """
+    """Return the top songs by spin count over ``since_utc..now``.
+
+    A *spin* is one full broadcast play of a song. Because Tier 1 / Tier 3 /
+    DJ talkover can briefly interrupt detection mid-song, we group the raw
+    ``broadcast_events`` rows for each song by identity, sort them by
+    ``timestamp_start``, and collapse consecutive segments that are within
+    ``spin_merge_gap_seconds`` of each other into one spin.
+
+    Two truly separate plays of the same track (e.g. morning + afternoon
+    rotation) stay as two spins because the gap between them exceeds the
+    merge window.
+    """
+    gap = SPIN_MERGE_GAP_SECONDS if spin_merge_gap_seconds is None else float(spin_merge_gap_seconds)
+    raw = store.connection.execute(
+        """
         SELECT
             e.song_id AS song_id,
             COALESCE(s.artist, e.artist) AS artist,
             COALESCE(s.title, e.track_title) AS title,
-            COUNT(*) AS play_count,
-            COALESCE(SUM(e.duration), 0.0) AS total_duration
+            e.timestamp_start,
+            e.timestamp_end,
+            e.duration
         FROM broadcast_events e
         LEFT JOIN songs s ON e.song_id = s.id
         WHERE e.category = 'SONG' AND e.timestamp_start >= ?
-        GROUP BY e.song_id, COALESCE(s.artist, e.artist), COALESCE(s.title, e.track_title)
-        ORDER BY play_count DESC, total_duration DESC
-        LIMIT ?
-    """
-    rows = store.connection.execute(sql, (since_utc, top_n)).fetchall()
-    return [
-        SongRow(
-            song_id=r[0],
-            artist=r[1],
-            title=r[2],
-            play_count=int(r[3]),
-            total_duration_seconds=float(r[4] or 0.0),
+        ORDER BY e.song_id IS NULL, e.song_id, e.timestamp_start ASC
+        """,
+        (since_utc,),
+    ).fetchall()
+
+    bucket: dict[tuple[int | None, str | None, str | None], list[tuple[str, str | None, float | None]]] = {}
+    order: list[tuple[int | None, str | None, str | None]] = []
+    for r in raw:
+        key = (r[0], r[1], r[2])
+        if key not in bucket:
+            bucket[key] = []
+            order.append(key)
+        bucket[key].append((r[3], r[4], r[5]))
+
+    songs: list[SongRow] = []
+    for key in order:
+        segments = bucket[key]
+        spin_count, total_duration = _count_spins(segments, gap)
+        songs.append(
+            SongRow(
+                song_id=key[0],
+                artist=key[1],
+                title=key[2],
+                spin_count=spin_count,
+                segment_count=len(segments),
+                total_duration_seconds=total_duration,
+            )
         )
-        for r in rows
-    ]
+
+    songs.sort(
+        key=lambda s: (s.spin_count, s.total_duration_seconds, s.segment_count),
+        reverse=True,
+    )
+    return songs[: max(0, int(top_n))]
+
+
+def _artist_dedupe_key(artist: str) -> str:
+    """Stable case- and whitespace-insensitive key for dedup.
+
+    Collapses internal whitespace and trims, so ``"foo  fighters "`` and
+    ``"Foo Fighters"`` hash to the same bucket. Returns ``""`` for blank
+    input — callers must skip empty keys.
+    """
+    return " ".join(artist.split()).casefold()
+
+
+def artists_top(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    top_n: int = 10,
+    spin_merge_gap_seconds: float | None = None,
+) -> list[ArtistRow]:
+    """Per-artist airtime rollup with case-folded dedup.
+
+    Returns one :class:`ArtistRow` per *artist* (not per song), summing spins
+    across every title the artist had on air. Two casing/whitespace variants
+    of the same artist name ("Foo Fighters" and "FOO FIGHTERS") collapse into
+    a single row; the most-frequent original casing wins for display.
+
+    Spin counting reuses the same per-title logic as :func:`songs_top`, so an
+    artist with two distinct songs (each played once cleanly) reports
+    ``spins=2, distinct_titles=2``, while an artist whose one song hit two
+    overlapping detection windows reports ``spins=1, distinct_titles=1,
+    segment_count=2``.
+    """
+    gap = SPIN_MERGE_GAP_SECONDS if spin_merge_gap_seconds is None else float(spin_merge_gap_seconds)
+    raw = store.connection.execute(
+        """
+        SELECT
+            e.song_id AS song_id,
+            COALESCE(s.artist, e.artist) AS artist,
+            COALESCE(s.title, e.track_title) AS title,
+            e.timestamp_start,
+            e.timestamp_end,
+            e.duration
+        FROM broadcast_events e
+        LEFT JOIN songs s ON e.song_id = s.id
+        WHERE e.category = 'SONG' AND e.timestamp_start >= ?
+        ORDER BY e.timestamp_start ASC
+        """,
+        (since_utc,),
+    ).fetchall()
+
+    # Per artist: track each (song_id, title) sub-bucket separately so we can
+    # count spins per title and then sum across titles. Also tally original
+    # casing so we can display the most-common variant. ``title_key`` falls
+    # back to a folded title when ``song_id`` is NULL (an unidentified track),
+    # so two distinct unknown songs by the same artist don't collide.
+    from collections import Counter
+
+    per_artist_titles: dict[str, dict[tuple[int | None, str], list[tuple[str, str | None, float | None]]]] = {}
+    per_artist_casing: dict[str, Counter[str]] = {}
+    per_artist_order: list[str] = []
+
+    for song_id, artist_raw, title_raw, start_iso, end_iso, dur in raw:
+        if artist_raw is None:
+            continue
+        artist_str = str(artist_raw).strip()
+        if not artist_str:
+            continue
+        key = _artist_dedupe_key(artist_str)
+        if not key:
+            continue
+        if key not in per_artist_titles:
+            per_artist_titles[key] = {}
+            per_artist_casing[key] = Counter()
+            per_artist_order.append(key)
+        per_artist_casing[key][artist_str] += 1
+
+        title_key: tuple[int | None, str]
+        if song_id is not None:
+            title_key = (int(song_id), "")
+        else:
+            title_lower = (str(title_raw).strip().casefold() if title_raw else "")
+            title_key = (None, title_lower)
+        per_artist_titles[key].setdefault(title_key, []).append((start_iso, end_iso, dur))
+
+    rows: list[ArtistRow] = []
+    for key in per_artist_order:
+        titles = per_artist_titles[key]
+        casing = per_artist_casing[key]
+        total_spins = 0
+        total_duration = 0.0
+        total_segments = 0
+        for segments in titles.values():
+            spins, dur = _count_spins(segments, gap)
+            total_spins += spins
+            total_duration += dur
+            total_segments += len(segments)
+        display = casing.most_common(1)[0][0] if casing else key
+        rows.append(
+            ArtistRow(
+                artist=display,
+                spin_count=total_spins,
+                distinct_titles=len(titles),
+                segment_count=total_segments,
+                total_duration_seconds=total_duration,
+            )
+        )
+
+    rows.sort(
+        key=lambda r: (-r.spin_count, -r.total_duration_seconds, -r.distinct_titles, r.artist.casefold()),
+    )
+    return rows[: max(0, int(top_n))]
 
 
 def timeline(

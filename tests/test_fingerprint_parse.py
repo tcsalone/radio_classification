@@ -9,6 +9,7 @@ import pytest
 from radio_classifier.fingerprint.audfprint_engine import (
     _audfprint_argv,
     _split_track_id,
+    parse_audfprint_batch_output,
     parse_audfprint_match_output,
 )
 from radio_classifier.fingerprint.types import FingerprintStatus
@@ -91,6 +92,34 @@ def test_parse_picks_first_match() -> None:
     assert r.status is FingerprintStatus.match
     assert r.artist == "A"
     assert r.title == "B"
+
+
+def test_parse_batch_output_maps_matches_to_queries(tmp_path) -> None:
+    q1 = tmp_path / "window_000001.wav"
+    q2 = tmp_path / "window_000002.wav"
+    q3 = tmp_path / "window_000003.wav"
+    stdout = "\n".join(
+        [
+            f"Matched {q1} as MGMT - Kids.mp3 with 42 of 80 common hashes",
+            f"NOMATCH {q2}",
+            "Matched window_000003.wav as AFI - Miss Murder.mp3 at  -3.2 s with 17 of 80 common hashes",
+        ]
+    )
+
+    results = parse_audfprint_batch_output(
+        stdout,
+        [q1, q2, q3],
+        ["ts1", "ts2", "ts3"],
+    )
+
+    assert [r.window_start_utc for r in results] == ["ts1", "ts2", "ts3"]
+    assert results[0].status is FingerprintStatus.match
+    assert results[0].artist == "MGMT"
+    assert results[0].title == "Kids"
+    assert results[1].status is FingerprintStatus.no_match
+    assert results[2].status is FingerprintStatus.match
+    assert results[2].artist == "AFI"
+    assert results[2].title == "Miss Murder"
 
 
 def test_split_track_id_handles_extensions_and_paths() -> None:

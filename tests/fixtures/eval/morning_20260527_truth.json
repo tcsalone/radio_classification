@@ -1,0 +1,129 @@
+{
+  "name": "morning_20260527_drive",
+  "capture_path": "data/captures/20260527T131242Z.wav",
+  "description": "User-validated 30-minute morning-drive capture used as a regression baseline.",
+  "validated_by_user_at": "2026-05-27",
+  "local_eval_db": "data/eval/morning_20260527_v2.db",
+  "checks": [
+    {
+      "id": "song-mgmt-kids",
+      "offset_seconds": 0,
+      "truth": {
+        "category": "SONG",
+        "artist": "MGMT",
+        "title": "Kids"
+      },
+      "assert_current": true
+    },
+    {
+      "id": "song-oasis-wonderwall",
+      "offset_seconds": 470,
+      "truth": {
+        "category": "SONG",
+        "artist": "Oasis",
+        "title": "Wonderwall"
+      },
+      "assert_current": true
+    },
+    {
+      "id": "song-afi-miss-murder",
+      "offset_seconds": 750,
+      "truth": {
+        "category": "SONG",
+        "artist": "AFI",
+        "title": "Miss Murder"
+      },
+      "assert_current": true,
+      "note": "Confirmed by user after initially holding back plays=1 Shazam discovery."
+    },
+    {
+      "id": "ad-infiniti-stories-from-the-pitch-start",
+      "offset_seconds": 900,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Infiniti"
+      },
+      "assert_current": true,
+      "note": "Start of Stories from the Pitch infomercial-style ad."
+    },
+    {
+      "id": "ad-infiniti-stories-from-the-pitch-mid",
+      "offset_seconds": 940,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Infiniti"
+      },
+      "assert_current": false,
+      "known_current_gap": "Currently classified as STATION/Odyssey from soccer-style copy inside the Infiniti-sponsored segment."
+    },
+    {
+      "id": "ad-home-depot",
+      "offset_seconds": 998,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Home Depot"
+      },
+      "assert_current": false,
+      "known_current_gap": "User identified this as a Home Depot commercial from 16:38-17:08; current event stitching is still noisy here."
+    },
+    {
+      "id": "ad-law-tigers-contest",
+      "offset_seconds": 1030,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Law Tigers"
+      },
+      "assert_current": true,
+      "note": "DJ-read contest spot; should still be COMMERCIAL."
+    },
+    {
+      "id": "ad-live105-audacy-sales",
+      "offset_seconds": 1110,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Audacy"
+      },
+      "assert_current": true,
+      "note": "Station ad-sales copy: Advertise with Live 105 at Audacy."
+    },
+    {
+      "id": "ad-tide-pods",
+      "offset_seconds": 1170,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Tide Pods"
+      },
+      "assert_current": true
+    },
+    {
+      "id": "ad-rolaids",
+      "offset_seconds": 1190,
+      "truth": {
+        "category": "COMMERCIAL",
+        "brand": "Rolaids"
+      },
+      "assert_current": true,
+      "note": "Single ~30s Rolaids antacid spot."
+    },
+    {
+      "id": "song-local-h-bound-for-the-floor",
+      "offset_seconds": 1210,
+      "truth": {
+        "category": "SONG",
+        "artist": "Local H",
+        "title": "Bound For The Floor"
+      },
+      "assert_current": true
+    },
+    {
+      "id": "song-no-doubt-underneath-it-all",
+      "offset_seconds": 1450,
+      "truth": {
+        "category": "SONG",
+        "artist": "No Doubt",
+        "title": "Underneath It All"
+      },
+      "assert_current": true
+    }
+  ]
+}

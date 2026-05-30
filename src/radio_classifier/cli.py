@@ -9,11 +9,13 @@ Subcommands:
 * ``fingerprint eval``  — run the recall harness against a truth CSV.
 * ``ingest``         — live RTL-SDR capture through the 3-tier funnel.
 * ``classify``       — offline 3-tier funnel on a WAV file.
-* ``report``         — CLI-only reports (commercials / brands / songs / timeline / summary).
+* ``report``         — CLI-only reports (commercials / brands / songs / artists / timeline / summary).
 * ``seed scrape``    — print a tracklist parsed from a station page.
 * ``seed download``  — fetch reference audio via yt-dlp (``[seeding]``).
 * ``songs discovered`` — list Shazam-discovered songs (and their tracklist status).
 * ``songs promote``    — append selected Shazam discoveries to ``tracklist.txt``.
+* ``songs dedupe``     — fold duplicate ``songs`` rows (e.g. shazam + audfprint
+  pairs for the same track) and re-point ``broadcast_events`` at the survivor.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -43,6 +46,38 @@ def _project_root() -> Path:
 
 def _default_db_path() -> Path:
     return _project_root() / "data" / "radio_classifier.db"
+
+
+class _CliConfigError(ValueError):
+    """Raised when a CLI argument is structurally invalid (e.g. empty path).
+
+    Distinguished from generic ``ValueError`` so :func:`main` can convert it
+    into a clean stderr message + non-zero exit code without printing a
+    Python traceback.
+    """
+
+
+def _resolve_db_path(raw: Path | None) -> Path:
+    """Resolve a ``--db-path`` argument into a concrete :class:`Path`.
+
+    *  ``None`` → fall back to :func:`_default_db_path`.
+    *  Empty string / ``"."`` / whitespace-only → :class:`_CliConfigError`.
+       This catches the common ``--db-path "$DB"`` foot-gun where ``$DB``
+       was never set in the operator's shell. Before this guard, an empty
+       string ended up opening the current working directory as a SQLite
+       file and surfaced as an opaque ``sqlite3.OperationalError`` traceback.
+    *  Anything else passes through unchanged.
+    """
+    if raw is None:
+        return _default_db_path()
+    text = str(raw).strip()
+    if not text or text == ".":
+        raise _CliConfigError(
+            "--db-path is empty. If you used a shell variable like `--db-path "
+            '"$DB"`, make sure $DB is set in this shell (e.g. '
+            "`export DB=data/eval/foo.db`), or pass the path literally."
+        )
+    return raw
 
 
 def _default_index_path() -> Path:
@@ -157,6 +192,20 @@ def _add_funnel_arguments(p: argparse.ArgumentParser) -> None:
         help='Language code, or "auto" for detection (default: en)',
     )
     p.add_argument(
+        "--whisper-beam-size",
+        type=int,
+        default=None,
+        help=(
+            "Whisper decode beam size (default: faster-whisper default; "
+            "try 1 only for speed/quality experiments)"
+        ),
+    )
+    p.add_argument(
+        "--whisper-vad-filter",
+        action="store_true",
+        help="Enable faster-whisper VAD filtering inside speech windows (default: off)",
+    )
+    p.add_argument(
         "--speech-min-rms",
         type=float,
         default=750.0,
@@ -202,6 +251,23 @@ def _add_json_lines(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_progress_arguments(p: argparse.ArgumentParser) -> None:
+    group = p.add_mutually_exclusive_group()
+    group.add_argument(
+        "--progress",
+        dest="progress",
+        action="store_true",
+        default=None,
+        help="Show classification progress, ETA, and running category counts on stderr",
+    )
+    group.add_argument(
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Disable classification progress output",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="radio-classifier", description="Local terrestrial radio classifier")
     sub = p.add_subparsers(dest="command", required=True)
@@ -226,10 +292,26 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- fingerprint
     fp = sub.add_parser("fingerprint", help="Manage the Tier-1 song fingerprint index")
     fp_sub = fp.add_subparsers(dest="fp_command", required=True)
-    fp_idx = fp_sub.add_parser("index", help="Build / extend the audfprint index")
+    fp_idx = fp_sub.add_parser(
+        "index",
+        help="Build (or rebuild) the audfprint song index from a directory of reference audio",
+    )
     fp_idx.add_argument("--dir", type=Path, required=True, help="Directory of reference audio files")
-    fp_idx.add_argument("--out", type=Path, default=None, help="Index file path (default: data/audfprint/songs.pklz)")
-    fp_idx.add_argument("--extend", action="store_true", help="Add to an existing index instead of overwriting")
+    fp_idx.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Index file path (default: data/audfprint/songs.pklz). Will be REBUILT if it exists.",
+    )
+    fp_idx.add_argument(
+        "--extend",
+        action="store_true",
+        help=(
+            "Append the new files into the existing index instead of rebuilding. "
+            "Default is rebuild because rebuild is safer (no stale entries, no audfprint "
+            "extend-mode hangs on bad inputs)."
+        ),
+    )
     fp_idx.add_argument("--glob", type=str, default="**/*", help="File glob inside --dir (default: all files)")
 
     fp_eval = fp_sub.add_parser("eval", help="Recall harness against truth CSV")
@@ -244,6 +326,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_funnel_arguments(cls)
     _add_persist_arguments(cls)
     _add_json_lines(cls)
+    _add_progress_arguments(cls)
+    cls.add_argument(
+        "--no-batch-tier1",
+        action="store_true",
+        help="Disable offline audfprint batch matching and use per-window Tier 1 calls",
+    )
     cls.add_argument("-v", "--verbose", action="store_true")
 
     # ---- ingest (live RTL-SDR)
@@ -277,8 +365,14 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- report
     rep = sub.add_parser("report", help="CLI reports against a v2 SQLite DB")
     rep_sub = rep.add_subparsers(dest="report_command", required=True)
-    for name in ("commercials", "brands", "songs", "timeline", "summary"):
-        r = rep_sub.add_parser(name)
+    for name in ("commercials", "brands", "songs", "artists", "timeline", "summary"):
+        help_text = None
+        if name == "artists":
+            help_text = (
+                "Per-artist airtime rollup (case-folded dedup, spins, distinct "
+                "titles, total airtime)"
+            )
+        r = rep_sub.add_parser(name, help=help_text)
         r.add_argument("--db-path", type=Path, default=None)
         r.add_argument("--since", type=str, default="24h")
         r.add_argument("--top", type=int, default=10, help="Limit (default 10)")
@@ -364,6 +458,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Tracklist file to append to (default: data/reference/tracklist.txt)",
     )
 
+    songs_dedupe = songs_sub.add_parser(
+        "dedupe",
+        help=(
+            "Fold same-song rows that differ only by source (shazam vs audfprint) "
+            "or by trivial casing/whitespace. Survivor keeps audfprint_track_id "
+            "when any sibling has one."
+        ),
+    )
+    songs_dedupe.add_argument("--db-path", type=Path, default=None)
+    songs_dedupe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the dedupe plan without modifying the DB.",
+    )
+
     return p
 
 
@@ -385,7 +494,7 @@ def cmd_prereq(args: argparse.Namespace) -> int:
 
 
 def cmd_db_init(args: argparse.Namespace) -> int:
-    path = args.db_path or _default_db_path()
+    path = _resolve_db_path(args.db_path)
     with BroadcastStore(path):
         pass
     print(f"radio-classifier: initialized {path}", file=sys.stderr)
@@ -418,9 +527,20 @@ def cmd_fp_index(args: argparse.Namespace) -> int:
         print(f"radio-classifier fingerprint index: no files matching {args.glob} under {src_dir}", file=sys.stderr)
         return 1
     index = AudfprintIndex(index_path=out)
-    index.build_or_extend(files, extend=args.extend or out.exists())
+    will_extend = args.extend
+    if will_extend and not out.exists():
+        print(
+            f"radio-classifier fingerprint index: --extend requested but index does not exist; "
+            f"creating fresh index at {out}",
+            file=sys.stderr,
+        )
+        will_extend = False
+    if not will_extend and out.exists():
+        out.unlink()
+    index.build_or_extend(files, extend=will_extend)
+    mode = "extended" if will_extend else "rebuilt"
     print(
-        f"radio-classifier: indexed {len(files)} files into {out}",
+        f"radio-classifier: {mode} index at {out} with {len(files)} files",
         file=sys.stderr,
     )
     return 0
@@ -487,6 +607,8 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
                 device=args.whisper_device,
                 compute_type=args.whisper_compute_type,
                 language=args.whisper_language,
+                beam_size=args.whisper_beam_size,
+                vad_filter=args.whisper_vad_filter,
             )
             llm = OllamaSpeechClassifier(
                 base_url=args.ollama_base_url,
@@ -545,7 +667,7 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
     store = None
     reducer = None
     if getattr(args, "persist", False):
-        db_path = args.db_path if args.db_path is not None else _default_db_path()
+        db_path = _resolve_db_path(args.db_path)
         store = BroadcastStore(db_path, use_wal=not getattr(args, "no_wal", False))
         reducer = SegmentReducer()
 
@@ -751,6 +873,143 @@ def _persist_brand_mentions(
         )
 
 
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "?"
+    total = int(round(seconds))
+    minutes, sec = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{sec:02d}s"
+    if minutes:
+        return f"{minutes:d}m{sec:02d}s"
+    return f"{sec:d}s"
+
+
+class _ProgressReporter:
+    """Small dependency-free progress reporter for offline classify."""
+
+    def __init__(self, *, total: int, enabled: bool, verbose: bool) -> None:
+        self.total = max(1, total)
+        self.enabled = enabled
+        self.verbose = verbose
+        self.started = time.monotonic()
+        self.counts: dict[str, int] = {
+            "SONG": 0,
+            "COMMERCIAL": 0,
+            "DJ": 0,
+            "STATION": 0,
+            "PSA_NEWS": 0,
+            "UNKNOWN": 0,
+        }
+        self._tty = sys.stderr.isatty() and not verbose
+        self._last_len = 0
+        # In non-TTY logs (Cursor terminals, redirected stderr), print at 5%
+        # increments so progress is visible without one extra line per window.
+        self._line_every = max(1, total // 20)
+
+    def observe(self, idx: int, result) -> None:
+        if not self.enabled:
+            return
+        category = None
+        if result.segment_input is not None:
+            category = result.segment_input.key.category.value
+        self.counts[category or "UNKNOWN"] = self.counts.get(category or "UNKNOWN", 0) + 1
+        if self._tty:
+            self._write_tty(idx, result.stage.value)
+            return
+        if idx == 1 or idx == self.total or idx % self._line_every == 0:
+            print(f"progress {self._line(idx, result.stage.value)}", file=sys.stderr)
+
+    def finish(self) -> None:
+        if self.enabled and self._tty:
+            print(file=sys.stderr)
+
+    def _line(self, idx: int, stage: str) -> str:
+        elapsed = max(0.001, time.monotonic() - self.started)
+        pct = min(100.0, idx / self.total * 100.0)
+        rate = idx / elapsed
+        remaining = (self.total - idx) / rate if rate > 0 else None
+        categories = (
+            f"song={self.counts['SONG']} "
+            f"ad={self.counts['COMMERCIAL']} "
+            f"dj={self.counts['DJ']} "
+            f"station={self.counts['STATION']} "
+            f"psa={self.counts['PSA_NEWS']} "
+            f"unknown={self.counts['UNKNOWN']}"
+        )
+        return (
+            f"{idx}/{self.total} {pct:5.1f}% "
+            f"elapsed={_format_duration(elapsed)} eta={_format_duration(remaining)} "
+            f"last={stage} {categories}"
+        )
+
+    def _write_tty(self, idx: int, stage: str) -> None:
+        text = f"\rclassify {self._line(idx, stage)}"
+        padding = " " * max(0, self._last_len - len(text))
+        print(text + padding, end="", file=sys.stderr, flush=True)
+        self._last_len = len(text)
+
+
+def _progress_enabled(args: argparse.Namespace) -> bool:
+    if args.progress is not None:
+        return bool(args.progress)
+    # Default to progress for interactive non-verbose runs. Verbose already
+    # emits one line per window, and explicit --progress can still combine both.
+    return sys.stderr.isatty() and not args.verbose
+
+
+class _CachedTier1:
+    """Tier-1 adapter backed by precomputed batch audfprint results."""
+
+    def __init__(self, results) -> None:
+        self._by_start = {r.window_start_utc: r for r in results}
+
+    def match_window(self, window):
+        result = self._by_start.get(window.window_start_utc)
+        if result is None:
+            from radio_classifier.fingerprint import FingerprintResult, FingerprintStatus
+
+            return FingerprintResult(
+                status=FingerprintStatus.skipped,
+                window_start_utc=window.window_start_utc,
+                message="batch Tier 1 result missing for window",
+            )
+        return replace(result, window_start_utc=window.window_start_utc)
+
+
+def _maybe_precompute_tier1(
+    args: argparse.Namespace,
+    bundle: FunnelBundle,
+    windows: list,
+    *,
+    progress_enabled: bool,
+) -> None:
+    if args.no_batch_tier1:
+        return
+    tier1 = getattr(bundle.orchestrator, "tier1", None)
+    if tier1 is None or not hasattr(tier1, "match_windows"):
+        return
+    if progress_enabled:
+        print(
+            f"progress tier1_batch start windows={len(windows)} "
+            "(one audfprint index load per batch)",
+            file=sys.stderr,
+        )
+    started = time.monotonic()
+    results = tier1.match_windows(windows)
+    bundle.orchestrator.tier1 = _CachedTier1(results)
+    if progress_enabled:
+        matches = sum(1 for r in results if r.status.value == "match")
+        errors = sum(1 for r in results if r.status.value == "error")
+        print(
+            "progress tier1_batch done "
+            f"elapsed={_format_duration(time.monotonic() - started)} "
+            f"matches={matches} errors={errors}",
+            file=sys.stderr,
+        )
+
+
 # ----------------------------------------------------------------- classify
 def cmd_classify(args: argparse.Namespace) -> int:
     path: Path = args.input
@@ -778,11 +1037,24 @@ def cmd_classify(args: argparse.Namespace) -> int:
         print("radio-classifier classify: no full windows", file=sys.stderr)
         return 0
 
+    progress_enabled = _progress_enabled(args)
     bundle = _build_funnel(args)
     try:
-        for w in windows:
+        _maybe_precompute_tier1(
+            args,
+            bundle,
+            windows,
+            progress_enabled=progress_enabled,
+        )
+        progress = _ProgressReporter(
+            total=len(windows),
+            enabled=progress_enabled,
+            verbose=args.verbose,
+        )
+        for idx, w in enumerate(windows, start=1):
             r = bundle.orchestrator.process(w)
             _emit_funnel(args, r, window_seconds=args.window_seconds)
+            progress.observe(idx, r)
             if bundle.reducer is not None:
                 new_ids = persist_input(bundle.reducer, bundle.store, r.segment_input)
                 if new_ids:
@@ -794,6 +1066,8 @@ def cmd_classify(args: argparse.Namespace) -> int:
                         heard_utc=r.window_start_utc,
                     )
     finally:
+        if "progress" in locals():
+            progress.finish()
         bundle.close(windows=windows, window_seconds=args.window_seconds)
     return 0
 
@@ -885,8 +1159,10 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------ report
 def cmd_report(args: argparse.Namespace) -> int:
     from radio_classifier.reports import (
+        artists_top,
         brands_top,
         commercials_top,
+        format_artists,
         format_brands,
         format_commercials,
         format_songs,
@@ -898,7 +1174,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         timeline,
     )
 
-    db_path = args.db_path or _default_db_path()
+    db_path = _resolve_db_path(args.db_path)
     if not db_path.exists():
         print(f"radio-classifier report: db not found: {db_path}", file=sys.stderr)
         return 1
@@ -918,6 +1194,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         elif args.report_command == "songs":
             rows = songs_top(store, since_utc=since_utc, top_n=args.top)
             print(format_songs(rows))
+        elif args.report_command == "artists":
+            rows = artists_top(store, since_utc=since_utc, top_n=args.top)
+            print(format_artists(rows))
         elif args.report_command == "timeline":
             rows = timeline(store, since_utc=since_utc, limit=args.limit)
             print(format_timeline(rows))
@@ -1013,7 +1292,7 @@ def cmd_songs_discovered(args: argparse.Namespace) -> int:
     from radio_classifier.discovery import list_shazam_discoveries
     from radio_classifier.reports import format_discoveries, parse_since
 
-    db_path = args.db_path or _default_db_path()
+    db_path = _resolve_db_path(args.db_path)
     if not db_path.exists():
         print(f"radio-classifier songs discovered: db not found: {db_path}", file=sys.stderr)
         return 1
@@ -1033,11 +1312,19 @@ def cmd_songs_discovered(args: argparse.Namespace) -> int:
     if not rows:
         return 0
     missing_ids = [r.song_id for r in rows if not r.in_tracklist]
+    review_ids = [r.song_id for r in rows if r.needs_review]
     print(
         f"\n{len(rows)} Shazam discoveries "
         f"({len(missing_ids)} not yet indexed in {tracklist}).",
         file=sys.stderr,
     )
+    if review_ids:
+        ids = ", ".join(str(sid) for sid in review_ids)
+        print(
+            f"{len(review_ids)} low-confidence discovery row(s) flagged for manual review "
+            f"(plays < 3): {ids}",
+            file=sys.stderr,
+        )
     if missing_ids:
         ids = " ".join(f"--song-id {sid}" for sid in missing_ids)
         print(
@@ -1054,7 +1341,7 @@ def cmd_songs_discovered(args: argparse.Namespace) -> int:
 def cmd_songs_promote(args: argparse.Namespace) -> int:
     from radio_classifier.discovery import promote_to_tracklist
 
-    db_path = args.db_path or _default_db_path()
+    db_path = _resolve_db_path(args.db_path)
     if not db_path.exists():
         print(f"radio-classifier songs promote: db not found: {db_path}", file=sys.stderr)
         return 1
@@ -1101,44 +1388,96 @@ def cmd_songs_promote(args: argparse.Namespace) -> int:
     return 0 if appended or not skipped else 1
 
 
+def cmd_songs_dedupe(args: argparse.Namespace) -> int:
+    from radio_classifier.discovery import dedupe_songs
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(f"radio-classifier songs dedupe: db not found: {db_path}", file=sys.stderr)
+        return 1
+
+    with BroadcastStore(db_path) as store:
+        report = dedupe_songs(store, dry_run=args.dry_run)
+
+    if not report.groups:
+        print("radio-classifier: no duplicate song groups found", file=sys.stderr)
+        return 0
+
+    verb = "would fold" if report.dry_run else "folded"
+    print(
+        f"radio-classifier: {verb} {report.collapsed_pairs} duplicate row(s) "
+        f"across {len(report.groups)} group(s)",
+        file=sys.stderr,
+    )
+    for group in report.groups:
+        survivor = group.survivor
+        survivor_note = "audfprint" if survivor.audfprint_track_id else survivor.source
+        print(
+            f"  {group.key[0]!r} / {group.key[1]!r} → keep song_id={survivor.song_id} "
+            f"({survivor_note})",
+            file=sys.stderr,
+        )
+        for loser in group.losers:
+            loser_note = "audfprint" if loser.audfprint_track_id else loser.source
+            print(
+                f"    drop song_id={loser.song_id} ({loser_note}, "
+                f"{loser.event_count} event(s))",
+                file=sys.stderr,
+            )
+
+    if not report.dry_run:
+        print(
+            f"\nradio-classifier: re-pointed {report.events_repointed} "
+            f"broadcast_events row(s); deleted {report.rows_deleted} song row(s)",
+            file=sys.stderr,
+        )
+    return 0
+
+
 # -------------------------------------------------------------------- main
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if args.command == "prereq-check":
-        return cmd_prereq(args)
-    if args.command == "db":
-        if args.db_command == "init":
-            return cmd_db_init(args)
-        if args.db_command == "migrate-from-live105sux":
-            return cmd_db_migrate(args)
+    try:
+        if args.command == "prereq-check":
+            return cmd_prereq(args)
+        if args.command == "db":
+            if args.db_command == "init":
+                return cmd_db_init(args)
+            if args.db_command == "migrate-from-live105sux":
+                return cmd_db_migrate(args)
+            return 2
+        if args.command == "fingerprint":
+            if args.fp_command == "index":
+                return cmd_fp_index(args)
+            if args.fp_command == "eval":
+                return cmd_fp_eval(args)
+            return 2
+        if args.command == "classify":
+            return cmd_classify(args)
+        if args.command == "ingest":
+            return cmd_ingest(args)
+        if args.command == "report":
+            return cmd_report(args)
+        if args.command == "seed":
+            if args.seed_command == "scrape":
+                return cmd_seed_scrape(args)
+            if args.seed_command == "download":
+                return cmd_seed_download(args)
+            return 2
+        if args.command == "songs":
+            if args.songs_command == "discovered":
+                return cmd_songs_discovered(args)
+            if args.songs_command == "promote":
+                return cmd_songs_promote(args)
+            if args.songs_command == "dedupe":
+                return cmd_songs_dedupe(args)
+            return 2
+        return 1
+    except _CliConfigError as exc:
+        print(f"radio-classifier: {exc}", file=sys.stderr)
         return 2
-    if args.command == "fingerprint":
-        if args.fp_command == "index":
-            return cmd_fp_index(args)
-        if args.fp_command == "eval":
-            return cmd_fp_eval(args)
-        return 2
-    if args.command == "classify":
-        return cmd_classify(args)
-    if args.command == "ingest":
-        return cmd_ingest(args)
-    if args.command == "report":
-        return cmd_report(args)
-    if args.command == "seed":
-        if args.seed_command == "scrape":
-            return cmd_seed_scrape(args)
-        if args.seed_command == "download":
-            return cmd_seed_download(args)
-        return 2
-    if args.command == "songs":
-        if args.songs_command == "discovered":
-            return cmd_songs_discovered(args)
-        if args.songs_command == "promote":
-            return cmd_songs_promote(args)
-        return 2
-    return 1
 
 
 if __name__ == "__main__":

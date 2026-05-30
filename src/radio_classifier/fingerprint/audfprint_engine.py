@@ -19,10 +19,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from radio_classifier.fingerprint.types import FingerprintResult, FingerprintStatus
+from radio_classifier.ingest.wav import write_mono_s16le_wav
 from radio_classifier.ingest.windows import AudioWindow
 from radio_classifier.speech.wav_temp import temp_wav_for_window
 
@@ -66,15 +68,26 @@ class AudfprintConfig:
 
     ``min_count`` is the minimum number of common hashes required to accept a
     match. Higher values reduce false positives at the cost of recall under
-    noisy reception. Empirically with a small seeded index, 5 was too permissive
-    on live FM (sister-song / similar-key false matches); 12 is the new floor.
-    Tune via :class:`AudfprintIndex` per deployment if needed.
+    noisy reception. Empirical history:
+
+    *  5 (upstream default) — far too permissive on live FM.
+    * 12 — first tightening; still produced clusters of 10-40s false matches
+      with scores in the 20-50 range (e.g. SLTS / Otherside / Clocks ghosts).
+    * 60 — current floor. A 2026-05-28 morning-drive validation run showed a
+      bimodal score distribution with a clean valley at [50, 70): every
+      manually-confirmed real match scored >=84, every confirmed false
+      positive scored <=49. Setting the floor at 60 drops the noise pile
+      without losing any verified real hit.
+
+    Tune via :class:`AudfprintIndex` per deployment if recall degrades on a
+    different station / index.
     """
 
-    min_count: int = 12
+    min_count: int = 60
     match_win: int = 2
     density: int = 20
     max_matches: int = 1
+    batch_size: int = 200
 
 
 @dataclass
@@ -125,6 +138,34 @@ class AudfprintIndex:
         with temp_wav_for_window(window) as wav_path:
             return self._match_file(wav_path, window.window_start_utc)
 
+    def match_windows(self, windows: list[AudioWindow]) -> list[FingerprintResult]:
+        """Batch-match windows with far fewer audfprint subprocess/index loads.
+
+        Offline ``classify`` can have hundreds of overlapping windows. Calling
+        ``audfprint match`` once per window is slow because every invocation
+        starts Python and reloads the index. This method writes a chunk of
+        temporary WAVs and passes them to one ``audfprint match`` call, reducing
+        N subprocess/index loads to roughly ``ceil(N / batch_size)``.
+        """
+        if not windows:
+            return []
+        if not self.exists():
+            return [
+                FingerprintResult(
+                    status=FingerprintStatus.skipped,
+                    window_start_utc=w.window_start_utc,
+                    message=f"audfprint index missing: {self.index_path}",
+                )
+                for w in windows
+            ]
+
+        results: list[FingerprintResult] = []
+        batch_size = max(1, int(self.config.batch_size))
+        for start in range(0, len(windows), batch_size):
+            chunk = windows[start : start + batch_size]
+            results.extend(self._match_window_chunk(chunk, chunk_offset=start))
+        return results
+
     def match_file(self, wav_path: Path) -> FingerprintResult:
         """Match a pre-existing WAV file (used by the eval harness)."""
         if not self.exists():
@@ -157,6 +198,48 @@ class AudfprintIndex:
                 message=(proc.stderr or proc.stdout).strip()[:400],
             )
         return parse_audfprint_match_output(proc.stdout, window_start_utc)
+
+    def _match_window_chunk(
+        self,
+        windows: list[AudioWindow],
+        *,
+        chunk_offset: int,
+    ) -> list[FingerprintResult]:
+        with tempfile.TemporaryDirectory(prefix="radio-classifier-audfprint-") as tmp:
+            tmp_dir = Path(tmp)
+            wav_paths: list[Path] = []
+            starts: list[str] = []
+            for i, window in enumerate(windows, start=chunk_offset):
+                wav_path = tmp_dir / f"window_{i:06d}.wav"
+                write_mono_s16le_wav(wav_path, window.samples, window.sample_rate_hz)
+                wav_paths.append(wav_path)
+                starts.append(window.window_start_utc)
+
+            cmd = list(_audfprint_argv())
+            cmd += [
+                "match",
+                "-d",
+                str(self.index_path),
+                "--min-count",
+                str(self.config.min_count),
+                "--match-win",
+                str(self.config.match_win),
+                "--max-matches",
+                str(self.config.max_matches),
+            ]
+            cmd += [str(p) for p in wav_paths]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                message = (proc.stderr or proc.stdout).strip()[:400]
+                return [
+                    FingerprintResult(
+                        status=FingerprintStatus.error,
+                        window_start_utc=s,
+                        message=message,
+                    )
+                    for s in starts
+                ]
+            return parse_audfprint_batch_output(proc.stdout, wav_paths, starts)
 
 
 def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> FingerprintResult:
@@ -204,6 +287,65 @@ def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> Fingerpr
         status=FingerprintStatus.no_match,
         window_start_utc=window_start_utc,
     )
+
+
+def parse_audfprint_batch_output(
+    stdout: str,
+    query_paths: list[Path],
+    window_start_utc: list[str],
+) -> list[FingerprintResult]:
+    """Parse one ``audfprint match`` output containing many query files."""
+    results = [
+        FingerprintResult(
+            status=FingerprintStatus.no_match,
+            window_start_utc=ts,
+        )
+        for ts in window_start_utc
+    ]
+    query_to_index: dict[str, int] = {}
+    for i, path in enumerate(query_paths):
+        query_to_index[str(path)] = i
+        query_to_index[path.name] = i
+
+    def lookup(query: str) -> int | None:
+        if query in query_to_index:
+            return query_to_index[query]
+        return query_to_index.get(Path(query).name)
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.upper().startswith("NOMATCH"):
+            parts = line.split()
+            if len(parts) >= 2:
+                idx = lookup(parts[1])
+                if idx is not None:
+                    results[idx] = FingerprintResult(
+                        status=FingerprintStatus.no_match,
+                        window_start_utc=window_start_utc[idx],
+                    )
+            continue
+
+        m = _MATCH_LINE_RE.search(line)
+        if not m:
+            continue
+        idx = lookup(m.group("query").strip())
+        if idx is None or results[idx].status is FingerprintStatus.match:
+            continue
+        track = m.group("track").strip()
+        count = int(m.group("count"))
+        artist, title = _split_track_id(track)
+        results[idx] = FingerprintResult(
+            status=FingerprintStatus.match,
+            window_start_utc=window_start_utc[idx],
+            track_id=track,
+            artist=artist,
+            title=title,
+            match_score=float(count),
+        )
+
+    return results
 
 
 def _split_track_id(track: str) -> tuple[str | None, str | None]:

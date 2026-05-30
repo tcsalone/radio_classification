@@ -1,6 +1,7 @@
 """CLI-only reporting: brands, commercials, songs, timeline, summary."""
 
 from radio_classifier.reports.format import (
+    format_artists,
     format_brands,
     format_commercials,
     format_discoveries,
@@ -9,6 +10,7 @@ from radio_classifier.reports.format import (
     format_timeline,
 )
 from radio_classifier.reports.queries import (
+    artists_top,
     brands_top,
     commercials_top,
     parse_since,
@@ -18,8 +20,10 @@ from radio_classifier.reports.queries import (
 )
 
 __all__ = [
+    "artists_top",
     "brands_top",
     "commercials_top",
+    "format_artists",
     "format_brands",
     "format_commercials",
     "format_discoveries",

@@ -146,31 +146,58 @@ def test_resolver_canonicalizes_known_brand_variants(tmp_path: Path) -> None:
 def test_resolver_canonicalizes_graton_resort_variants(tmp_path: Path) -> None:
     resolver, store = _resolver(tmp_path)
     try:
-        r1 = resolver.resolve(
-            brand="Creighton Resort and Casino",
-            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
-            duration_seconds=20.0,
-            signature=None,
-        )
-        r2 = resolver.resolve(
-            brand="Greaten Resort and Casino",
-            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
-            duration_seconds=20.0,
-            signature=None,
-        )
-        r3 = resolver.resolve(
-            brand="Grayton Resort and Casino",
-            transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
-            duration_seconds=20.0,
-            signature=None,
-        )
-
-        assert r1.brand_id == r2.brand_id
-        assert r1.brand_id == r3.brand_id
+        variants = [
+            "Creighton Resort and Casino",
+            "Greaten Resort and Casino",
+            "Grayton Resort and Casino",
+            "Grayton Resort & Casino",
+            "GreatOn.com",
+            "Greaton.com",
+            "Zorton Casino",
+        ]
+        results = [
+            resolver.resolve(
+                brand=v,
+                transcript="Visit Graton Resort and Casino for gaming dining and entertainment",
+                duration_seconds=20.0,
+                signature=None,
+            )
+            for v in variants
+        ]
+        brand_ids = {r.brand_id for r in results}
+        assert len(brand_ids) == 1
         row = store.connection.execute(
-            "SELECT canonical_name FROM brands WHERE id = ?", (r1.brand_id,)
+            "SELECT canonical_name FROM brands WHERE id = ?", (results[0].brand_id,)
         ).fetchone()
         assert row[0] == "Graton Resort and Casino"
+    finally:
+        store.close()
+
+
+def test_resolver_canonicalizes_izervay_variants(tmp_path: Path) -> None:
+    """Whisper consistently mangles the FDA-approved Izervay brand name.
+
+    Validated against the 2026-05-28 morning-drive capture where the same ad
+    surfaced as 'Eyservé', 'iZERVE', and 'EvasenQ' across consecutive windows.
+    """
+    resolver, store = _resolver(tmp_path)
+    try:
+        variants = ["Izervay", "Izerve", "iZERVE", "Eyservé", "EvasenQ", "Eye Survey"]
+        results = [
+            resolver.resolve(
+                brand=v,
+                transcript="Ask your retina specialist about Izervay for geographic atrophy",
+                duration_seconds=30.0,
+                signature=None,
+            )
+            for v in variants
+        ]
+        brand_ids = {r.brand_id for r in results}
+        assert len(brand_ids) == 1
+        row = store.connection.execute(
+            "SELECT canonical_name FROM brands WHERE id = ?", (results[0].brand_id,)
+        ).fetchone()
+        assert row[0] == "Izervay"
     finally:
         store.close()
 

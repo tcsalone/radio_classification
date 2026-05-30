@@ -20,9 +20,72 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from radio_classifier.persistence.broadcast_store import BroadcastStore
 from radio_classifier.segments.normalize import normalize_token
+
+
+LOW_CONFIDENCE_PLAY_THRESHOLD = 3
+
+
+# ---------------------------------------------------------------- dedupe types
+@dataclass
+class _DedupeMember:
+    """One ``songs`` row in a dedupe group."""
+
+    song_id: int
+    artist: str | None
+    title: str | None
+    source: str
+    audfprint_track_id: str | None
+    event_count: int
+
+
+@dataclass
+class DedupeGroup:
+    """Same-song rows that should fold into a single survivor.
+
+    Members are sorted: the **first** member is the survivor (preferred when
+    folding), every other member is a loser whose ``broadcast_events`` will
+    be re-pointed at the survivor before the loser row is deleted.
+
+    Survivor selection rules, in priority order:
+
+    1.  A row with a non-NULL ``audfprint_track_id`` always beats one without
+        (audfprint matches are deterministic; Shazam matches are best-effort).
+    2.  Within that tier, ``source = 'audfprint'`` beats ``'shazam'`` /
+        anything else.
+    3.  Within that tier, the row with the **most** existing ``event_count``
+        wins (preserving the most history with the fewest rewrites).
+    4.  Final tie-breaker: lowest ``song_id`` (earliest discovery).
+    """
+
+    key: tuple[str, str]
+    members: list[_DedupeMember]
+
+    @property
+    def survivor(self) -> _DedupeMember:
+        return self.members[0]
+
+    @property
+    def losers(self) -> list[_DedupeMember]:
+        return self.members[1:]
+
+
+@dataclass
+class DedupeReport:
+    """Result of one :func:`dedupe_songs` invocation."""
+
+    groups: list[DedupeGroup]
+    events_repointed: int
+    rows_deleted: int
+    dry_run: bool
+
+    @property
+    def collapsed_pairs(self) -> int:
+        """How many ``songs`` rows would disappear (sum of group sizes - 1)."""
+        return sum(len(g.losers) for g in self.groups)
 
 
 # ---------------------------------------------------------------------- types
@@ -37,6 +100,7 @@ class DiscoveryRow:
     play_count: int
     last_heard_utc: str | None
     in_tracklist: bool
+    needs_review: bool
 
 
 @dataclass
@@ -128,6 +192,7 @@ def list_shazam_discoveries(
                 play_count=plays,
                 last_heard_utc=r[5],
                 in_tracklist=in_tracklist,
+                needs_review=plays < LOW_CONFIDENCE_PLAY_THRESHOLD,
             )
         )
     return results
@@ -280,6 +345,134 @@ def _tracklist_contains(
 def _norm(value: str | None) -> str | None:
     """Wrapper around :func:`normalize_token` so ``None`` flows through cleanly."""
     return normalize_token(value) if value else None
+
+
+def _normalize_dedupe_key(artist: str | None, title: str | None) -> tuple[str, str]:
+    """Same casefold-and-trim rule used by ``BroadcastStore.upsert_song``.
+
+    Returning a 2-tuple of strings (not Optional) lets the caller use the
+    value directly as a dict key without worrying about Nones — empty
+    strings are still distinguishable from real content.
+    """
+    return (
+        (artist or "").strip().casefold(),
+        (title or "").strip().casefold(),
+    )
+
+
+def _iter_dedupe_groups(store: BroadcastStore) -> Iterator[DedupeGroup]:
+    """Yield every dedupe group with at least two members.
+
+    The query joins ``broadcast_events`` so the survivor-picking heuristic can
+    factor in how many existing rows depend on each candidate (the row with
+    the most events is cheapest to keep, requiring the fewest re-points).
+    """
+    rows = store.connection.execute(
+        """
+        SELECT
+            s.id,
+            s.artist,
+            s.title,
+            s.source,
+            s.audfprint_track_id,
+            (SELECT COUNT(*) FROM broadcast_events e WHERE e.song_id = s.id) AS event_count
+        FROM songs s
+        ORDER BY s.id ASC
+        """
+    ).fetchall()
+
+    buckets: dict[tuple[str, str], list[_DedupeMember]] = {}
+    for r in rows:
+        member = _DedupeMember(
+            song_id=int(r[0]),
+            artist=r[1],
+            title=r[2],
+            source=str(r[3] or ""),
+            audfprint_track_id=r[4],
+            event_count=int(r[5] or 0),
+        )
+        buckets.setdefault(_normalize_dedupe_key(member.artist, member.title), []).append(member)
+
+    for key, members in buckets.items():
+        if len(members) < 2:
+            continue
+        if not key[0] or not key[1]:
+            # Don't fold rows that have no artist/title — those are useless
+            # records that should be deleted by hand, not auto-merged.
+            continue
+        ranked = sorted(
+            members,
+            key=lambda m: (
+                m.audfprint_track_id is None,        # has track_id → first
+                0 if m.source == "audfprint" else 1, # audfprint source → first
+                -m.event_count,                       # most events → first
+                m.song_id,                            # earliest id → first
+            ),
+        )
+        yield DedupeGroup(key=key, members=ranked)
+
+
+def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeReport:
+    """Fold ``songs`` rows that share a normalized (artist, title) identity.
+
+    See :class:`DedupeGroup` for survivor-selection rules. The actual work,
+    in transactional order:
+
+    1.  Re-point ``broadcast_events.song_id`` from each loser to the
+        survivor. (The :class:`DedupeGroup` ordering guarantees the survivor
+        is the row that already has an ``audfprint_track_id`` if any of the
+        siblings did, so future Tier 1 matches stay resolvable.)
+    2.  If the survivor's ``audfprint_track_id`` is still NULL but one of the
+        losers had one, copy it over. (Belt-and-braces — the survivor-pick
+        usually already satisfies this, but we double-check so the dedupe
+        is idempotent and order-of-operations-safe.)
+    3.  Delete the loser ``songs`` rows.
+
+    Pass ``dry_run=True`` to compute and return the report without writing.
+    """
+    groups = list(_iter_dedupe_groups(store))
+    repointed = 0
+    deleted = 0
+    if not dry_run and groups:
+        conn = store.connection
+        conn.execute("BEGIN")
+        try:
+            for group in groups:
+                survivor = group.survivor
+                loser_ids = [m.song_id for m in group.losers]
+                placeholders = ",".join("?" * len(loser_ids))
+                cur = conn.execute(
+                    f"UPDATE broadcast_events SET song_id = ?, artist = COALESCE(artist, ?), "
+                    f"track_title = COALESCE(track_title, ?) "
+                    f"WHERE song_id IN ({placeholders})",
+                    [survivor.song_id, survivor.artist, survivor.title, *loser_ids],
+                )
+                repointed += cur.rowcount or 0
+                if survivor.audfprint_track_id is None:
+                    rescue = next(
+                        (m for m in group.losers if m.audfprint_track_id is not None),
+                        None,
+                    )
+                    if rescue is not None:
+                        conn.execute(
+                            "UPDATE songs SET audfprint_track_id = ?, source = ? WHERE id = ?",
+                            (rescue.audfprint_track_id, "audfprint", survivor.song_id),
+                        )
+                cur = conn.execute(
+                    f"DELETE FROM songs WHERE id IN ({placeholders})",
+                    loser_ids,
+                )
+                deleted += cur.rowcount or 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return DedupeReport(
+        groups=groups,
+        events_repointed=repointed,
+        rows_deleted=deleted,
+        dry_run=dry_run,
+    )
 
 
 def _append_batch(

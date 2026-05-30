@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from radio_classifier.discovery import (
+    dedupe_songs,
     list_shazam_discoveries,
     promote_to_tracklist,
 )
@@ -83,8 +84,10 @@ def test_list_shazam_discoveries_ranks_by_plays(tmp_path: Path) -> None:
         assert rows[0].artist == "Djo"
         assert rows[0].play_count == 3
         assert rows[0].in_tracklist is False
+        assert rows[0].needs_review is False
         assert rows[1].artist == "Modest Mouse"
         assert rows[1].play_count == 1
+        assert rows[1].needs_review is True
     finally:
         store.close()
 
@@ -140,6 +143,8 @@ def test_format_discoveries_renders_table(tmp_path: Path) -> None:
         text = format_discoveries(rows)
         assert "Djo" in text
         assert "missing" in text
+        assert "manual" in text
+        assert "review" in text
         assert "plays" in text
     finally:
         store.close()
@@ -268,5 +273,180 @@ def test_promote_unknown_song_id(tmp_path: Path) -> None:
         )
         assert result.appended_count == 0
         assert "not found" in result.promoted[0].reason
+    finally:
+        store.close()
+
+
+# ----------------------------------------------------------------- dedupe tests
+def _seed_dupe_db(tmp_path: Path) -> tuple[BroadcastStore, dict[str, int]]:
+    """Build a DB that simulates the pre-fix pollution: Shazam + audfprint
+    rows for the same songs, plus already-clean rows for control.
+
+    Returns the open store and a mapping of human-readable labels to the
+    expected surviving ``songs.id`` for each test scenario. The seed has to
+    bypass the normalised upsert (we want to demonstrate cleanup of old
+    state), so it writes rows directly via SQL.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    store = BroadcastStore(tmp_path / "dupe.db")
+    conn = store.connection
+
+    # Pair 1: shazam row first (id will be lower), audfprint row second.
+    # Survivor MUST be the audfprint row because it has a track id.
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+        ("Foo Fighters", "Times Like These", "shazam", None),
+    )
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+        ("Foo Fighters", "Times Like These", "audfprint", "ref/foo.mp3"),
+    )
+
+    # Pair 2: casing variation only — pick survivor by event count.
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+        ("Evanescence", "Bring Me to Life", "shazam", None),  # lowercase 'to'
+    )
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+        ("Evanescence", "Bring Me To Life", "audfprint", "ref/evan.mp3"),  # caps 'To'
+    )
+
+    # Clean control: a single-row song should be untouched.
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+        ("Nirvana", "Lithium", "audfprint", "ref/nirvana.mp3"),
+    )
+
+    conn.commit()
+
+    ids = {row[2]: row[0] for row in conn.execute("SELECT id, artist, title FROM songs")}
+    label_to_id = {
+        "foo_shazam": conn.execute(
+            "SELECT id FROM songs WHERE artist = 'Foo Fighters' AND source = 'shazam'"
+        ).fetchone()[0],
+        "foo_audfprint": conn.execute(
+            "SELECT id FROM songs WHERE artist = 'Foo Fighters' AND source = 'audfprint'"
+        ).fetchone()[0],
+        "evan_shazam": conn.execute(
+            "SELECT id FROM songs WHERE artist = 'Evanescence' AND source = 'shazam'"
+        ).fetchone()[0],
+        "evan_audfprint": conn.execute(
+            "SELECT id FROM songs WHERE artist = 'Evanescence' AND source = 'audfprint'"
+        ).fetchone()[0],
+        "nirvana": conn.execute(
+            "SELECT id FROM songs WHERE artist = 'Nirvana'"
+        ).fetchone()[0],
+    }
+
+    # A few broadcast_events on each side so we can verify repointing.
+    now = datetime.now(tz=timezone.utc)
+
+    def _evt(song_id: int, offset_min: int) -> None:
+        start = now - timedelta(minutes=offset_min)
+        end = start + timedelta(seconds=180)
+        conn.execute(
+            "INSERT INTO broadcast_events "
+            "(timestamp_start, timestamp_end, duration, category, song_id, artist, track_title) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                _iso(start),
+                _iso(end),
+                180.0,
+                "SONG",
+                song_id,
+                "x",
+                "y",
+            ),
+        )
+
+    _evt(label_to_id["foo_shazam"], 60)       # 1 event on Foo Shazam
+    _evt(label_to_id["foo_audfprint"], 50)    # 1 event on Foo audfprint
+    _evt(label_to_id["evan_shazam"], 40)      # 2 events on Evan shazam (will win on event count tie if both lacked track_id, but audfprint should still win)
+    _evt(label_to_id["evan_shazam"], 35)
+    _evt(label_to_id["evan_audfprint"], 30)
+    _evt(label_to_id["nirvana"], 20)
+    conn.commit()
+    return store, label_to_id
+
+
+def test_dedupe_folds_shazam_into_audfprint_when_track_id_present(tmp_path: Path) -> None:
+    """Foo Fighters has a Shazam row (no track id) and an audfprint row (with
+    track id). The audfprint row must win regardless of insertion order or
+    event count."""
+    store, ids = _seed_dupe_db(tmp_path)
+    try:
+        report = dedupe_songs(store, dry_run=False)
+        assert report.dry_run is False
+        assert report.collapsed_pairs == 2  # Foo + Evanescence groups, 1 loser each
+        assert report.events_repointed == 3  # 1 Foo shazam + 2 Evan shazam events
+        assert report.rows_deleted == 2
+
+        # Survivor for Foo is the audfprint row.
+        survivor_id = ids["foo_audfprint"]
+        row = store.connection.execute(
+            "SELECT id, source, audfprint_track_id FROM songs WHERE artist = 'Foo Fighters'"
+        ).fetchall()
+        assert len(row) == 1
+        assert row[0] == (survivor_id, "audfprint", "ref/foo.mp3")
+
+        # Both Foo events now point at the survivor.
+        cnt = store.connection.execute(
+            "SELECT COUNT(*) FROM broadcast_events WHERE song_id = ?", (survivor_id,)
+        ).fetchone()[0]
+        assert cnt == 2
+    finally:
+        store.close()
+
+
+def test_dedupe_dry_run_is_pure(tmp_path: Path) -> None:
+    """A dry run reports what would happen without touching the DB."""
+    store, _ = _seed_dupe_db(tmp_path)
+    try:
+        report = dedupe_songs(store, dry_run=True)
+        assert report.dry_run is True
+        assert report.collapsed_pairs == 2
+        assert report.events_repointed == 0  # nothing actually written
+        assert report.rows_deleted == 0
+
+        # The pollution is still there for a real run later.
+        n_songs = store.connection.execute("SELECT COUNT(*) FROM songs").fetchone()[0]
+        assert n_songs == 5
+    finally:
+        store.close()
+
+
+def test_dedupe_leaves_singletons_alone(tmp_path: Path) -> None:
+    """A song with only one row must not appear in any dedupe group."""
+    store, ids = _seed_dupe_db(tmp_path)
+    try:
+        report = dedupe_songs(store, dry_run=False)
+        nirvana_id = ids["nirvana"]
+        # No group should mention Nirvana.
+        assert all("nirvana" not in g.key[0] for g in report.groups)
+        # And the row still exists with its track id intact.
+        row = store.connection.execute(
+            "SELECT id, audfprint_track_id FROM songs WHERE id = ?", (nirvana_id,)
+        ).fetchone()
+        assert row == (nirvana_id, "ref/nirvana.mp3")
+    finally:
+        store.close()
+
+
+def test_dedupe_skips_rows_with_blank_artist_or_title(tmp_path: Path) -> None:
+    """Two ``(None, None)`` rows must NOT be auto-merged — they have no usable
+    identity and need manual inspection."""
+    store = BroadcastStore(tmp_path / "blanks.db")
+    try:
+        conn = store.connection
+        conn.execute("INSERT INTO songs (artist, title, source) VALUES (NULL, NULL, 'shazam')")
+        conn.execute("INSERT INTO songs (artist, title, source) VALUES (NULL, NULL, 'shazam')")
+        conn.execute("INSERT INTO songs (artist, title, source) VALUES ('', '', 'shazam')")
+        conn.commit()
+
+        report = dedupe_songs(store, dry_run=False)
+        assert report.groups == []
+        assert report.rows_deleted == 0
     finally:
         store.close()

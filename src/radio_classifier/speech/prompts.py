@@ -33,32 +33,46 @@ Decision tree (apply IN ORDER, stop at the first match):
    listener (call to action, "visit", "buy", "call now", financing offers,
    sponsor reads). This includes DJ-read paid spots, contests presented on
    behalf of an advertiser, station ad-sales copy ("Advertise with Live 105 at
-   Audacy"), sponsored branded content, and infomercial-style features. The
-   product/brand goes in "brand". Provide commercial_signature with 2-4
-   key_phrases capturing the ad's identity (slogan, tagline, distinctive
-   product or claim). duration_bucket_seconds should be the nearest 5-second
-   multiple to the apparent ad length.
+   Audacy"), sponsored branded content, infomercial-style features, and
+   first-person testimonial ad openings ("I love this place, I've been coming
+   here since I was a kid...", "She means everything to me..."). The
+   product/brand goes in "brand"; for movie or streaming ads, use the title
+   ("Star Wars: The Mandalorian", "Wicked", "Stranger Things") as the brand.
+   Provide commercial_signature with 2-4 key_phrases capturing the ad's
+   identity (slogan, tagline, distinctive product or claim).
+   duration_bucket_seconds should be the nearest 5-second multiple to the
+   apparent ad length.
 
-3. PSA_NEWS — public service announcements, civic/safety, traffic, weather,
-   news headlines, AMBER alerts. brand may be null or the issuing agency.
-   commercial_signature=null.
+3. PSA_NEWS — public service announcements from non-commercial sources
+   (government, civic/safety/health, AMBER alerts), news headlines, and
+   genuine on-air weather/traffic reports. Reserve PSA_NEWS for content that
+   would still run on a non-commercial station. Heartfelt testimonial
+   openings ("I love this place...", "I've been her doctor for twenty
+   years...") that lead into a brand call-to-action are COMMERCIAL, not
+   PSA_NEWS. If a weather/traffic report is sponsored ("today's forecast
+   brought to you by Capital One"), still classify as PSA_NEWS, but record
+   the sponsor in brand_mentions with type "tag". commercial_signature=null.
 
-4. STATION — the transcript is a station ID, sweeper, liner ("You're listening
-   to 105.3", "Up next ten in a row", "Now playing"), artist/venue promo,
-   station voiceover, or short non-selling jingle. Favor STATION for short
-   branded station phrases like "Live 105 presents ...", "keep it on Live 105",
-   "your source for music discovery", or celebrity liners where the only
-   purpose is identifying/promoting the station. Do NOT use STATION for copy
-   that sells advertising services or tells listeners to advertise with the
-   station; that is COMMERCIAL. brand=station call letters / name if present.
+4. STATION — short station IDs, sweepers, generic liners ("You're listening
+   to 105.3", "Up next ten in a row", "Now playing"), celebrity station-ID
+   drops, and short non-selling jingles. brand = the station name. Do NOT
+   use STATION for:
+     - sponsored weather/traffic (that is PSA_NEWS with a brand_mention tag);
+     - DJ promos for specific events, concerts, contests, or upcoming shows
+       ("Live 105 presents Julia Wolf at the Warfield October 23rd") — those
+       are DJ unless they are a paid third-party promotion;
+     - copy that sells advertising services to listeners ("Advertise with
+       Live 105 at Audacy") — that is COMMERCIAL.
    commercial_signature=null.
 
 5. DJ — human host banter, extended song intros, listener interaction, contest
-   gameplay, music commentary, weather chitchat that is NOT a forecast.
-   brand=null UNLESS the DJ explicitly names a sponsor in passing. If the DJ
-   is reading ad copy, giving a call-to-action, promoting a contest for a law
-   firm/casino/car dealer, or telling listeners to visit/call/go online for a
-   sponsor, classify COMMERCIAL instead of DJ.
+   gameplay, music commentary, weather chitchat that is NOT a forecast, and
+   DJ-led promotion of upcoming station events ("we've got Julia Wolf live at
+   the Warfield next week"). brand=null UNLESS the DJ explicitly names a
+   sponsor in passing. If the DJ is reading ad copy verbatim, giving a
+   call-to-action for an outside business, promoting a contest sponsored by a
+   law firm/casino/car dealer, or telling listeners to visit/call/go online
+   for a sponsor, classify COMMERCIAL instead of DJ.
 
 brand_mentions: include EVERY brand named in the transcript (including ad
 copy), with type:
@@ -149,6 +163,74 @@ FEW_SHOTS: list[dict[str, str]] = [
             '"brand_mentions":[{"name":"DHS","type":"tag"}],'
             '"commercial_signature":null,"confidence":0.85,'
             '"rationale":"Public service announcement, no commercial intent."}'
+        ),
+    },
+    {
+        "user": (
+            "I love this place. I've been surfing here since I was a kid. Now seeing "
+            "my grandson out on the water means everything to me. Ask your retina "
+            "specialist about Izervay, an FDA-approved treatment for geographic atrophy."
+        ),
+        "assistant": (
+            '{"class":"COMMERCIAL","brand":"Izervay",'
+            '"brand_mentions":[{"name":"Izervay","type":"paid_ad"}],'
+            '"commercial_signature":{"key_phrases":["FDA-approved treatment","geographic atrophy","Izervay","retina specialist"],"duration_bucket_seconds":30},'
+            '"confidence":0.9,'
+            '"rationale":"Heartfelt testimonial opener leading into an Izervay product pitch; not a PSA."}'
+        ),
+    },
+    {
+        "user": (
+            "Sunny and seventy-five today across the Bay Area with a light onshore breeze. "
+            "Tomorrow turns cloudy with a chance of afternoon showers. Today's forecast is "
+            "brought to you by Capital One. What's in your wallet?"
+        ),
+        "assistant": (
+            '{"class":"PSA_NEWS","brand":null,'
+            '"brand_mentions":[{"name":"Capital One","type":"tag"}],'
+            '"commercial_signature":null,"confidence":0.9,'
+            '"rationale":"Sponsored weather forecast; the broadcast content is informational so this is PSA_NEWS with a sponsor tag."}'
+        ),
+    },
+    {
+        "user": (
+            "Live 105 presents Julia Wolf live at the Warfield on October 23rd. "
+            "She's hanging with us in just a couple of weeks. Insiders can win an "
+            "invitation to a mystery San Francisco lunchtime performance."
+        ),
+        "assistant": (
+            '{"class":"DJ","brand":"Live 105",'
+            '"brand_mentions":[{"name":"Live 105","type":"tag"},{"name":"Julia Wolf","type":"dj_shoutout"}],'
+            '"commercial_signature":null,"confidence":0.85,'
+            '"rationale":"DJ promo for an upcoming station-hosted concert and contest; not a paid third-party ad and not a generic station sweeper."}'
+        ),
+    },
+    {
+        "user": (
+            "Chrome especially with this perfect spring weather. But in our community we "
+            "know it's not a matter of if it's when an accident happens. That's why Law "
+            "Tigers has my back. Visit lawtigers.com today."
+        ),
+        "assistant": (
+            '{"class":"COMMERCIAL","brand":"Law Tigers",'
+            '"brand_mentions":[{"name":"Law Tigers","type":"paid_ad"}],'
+            '"commercial_signature":{"key_phrases":["motorcycle accident","Law Tigers","lawtigers.com"],"duration_bucket_seconds":30},'
+            '"confidence":0.9,'
+            '"rationale":"DJ-read verbatim attorney ad copy with a call-to-action; classify as COMMERCIAL even though a host voice is reading it."}'
+        ),
+    },
+    {
+        "user": (
+            "Always wear your seatbelt. Star Wars The Mandalorian and Grogu, rated PG-13, "
+            "may be inappropriate for children under 13. Now playing in theaters and IMAX. "
+            "Get tickets at fandango dot com."
+        ),
+        "assistant": (
+            '{"class":"COMMERCIAL","brand":"Star Wars: The Mandalorian and Grogu",'
+            '"brand_mentions":[{"name":"Star Wars: The Mandalorian and Grogu","type":"paid_ad"},{"name":"Fandango","type":"tag"}],'
+            '"commercial_signature":{"key_phrases":["Star Wars Mandalorian and Grogu","now playing in theaters","fandango"],"duration_bucket_seconds":15},'
+            '"confidence":0.9,'
+            '"rationale":"Movie theatrical ad; use the film title as the brand."}'
         ),
     },
 ]

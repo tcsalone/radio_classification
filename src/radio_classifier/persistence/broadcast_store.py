@@ -122,12 +122,65 @@ class BroadcastStore:
         audfprint_track_id: str | None = None,
         source: str = "audfprint",
     ) -> int:
-        row = self._conn.execute(
-            "SELECT id FROM songs WHERE artist IS ? AND title IS ? AND source = ?",
-            (artist, title, source),
+        """Insert-or-update a song row keyed on (case-folded artist, case-folded title).
+
+        Prior to 2026-05-30 the lookup also included ``source``, which meant a
+        Shazam discovery row and a later audfprint match for the *same* song
+        coexisted as two rows. That, plus loose casing (e.g. "Bring Me to Life"
+        vs "Bring Me To Life"), polluted every report.
+
+        New behaviour:
+
+        *  Look up by ``LOWER(TRIM(artist))`` / ``LOWER(TRIM(title))`` —
+           source-agnostic and case-insensitive — so a Shazam row found later
+           by audfprint resolves to the same row.
+        *  If the existing row is missing ``audfprint_track_id`` and the new
+           call supplies one, fill it in and upgrade the source to
+           ``audfprint`` (a confirmed reference recording is the strongest
+           signal we can record).
+        *  Otherwise leave the existing row untouched and return its id.
+        """
+
+        norm_artist = (artist or "").strip().casefold()
+        norm_title = (title or "").strip().casefold()
+        existing = self._conn.execute(
+            """
+            SELECT id, audfprint_track_id, source
+            FROM songs
+            WHERE LOWER(TRIM(COALESCE(artist, ''))) = ?
+              AND LOWER(TRIM(COALESCE(title,  ''))) = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (norm_artist, norm_title),
         ).fetchone()
-        if row is not None:
-            return int(row[0])
+        if existing is not None:
+            song_id = int(existing[0])
+            existing_track_id = existing[1]
+            existing_source = existing[2]
+            if existing_track_id is None and audfprint_track_id is not None:
+                # Upgrade the row in place: a Shazam discovery has been
+                # confirmed against a real reference file we can fingerprint.
+                self._conn.execute(
+                    """
+                    UPDATE songs
+                       SET audfprint_track_id = ?,
+                           source = ?
+                     WHERE id = ?
+                    """,
+                    (audfprint_track_id, "audfprint", song_id),
+                )
+                self._conn.commit()
+            elif existing_source != source and source == "audfprint" and existing_source == "shazam":
+                # No track id either way (caller didn't supply one and we
+                # don't have one), but a deterministic audfprint match still
+                # outranks the prior Shazam guess for "source".
+                self._conn.execute(
+                    "UPDATE songs SET source = ? WHERE id = ?",
+                    ("audfprint", song_id),
+                )
+                self._conn.commit()
+            return song_id
         cur = self._conn.execute(
             """
             INSERT INTO songs (audfprint_track_id, artist, title, source)

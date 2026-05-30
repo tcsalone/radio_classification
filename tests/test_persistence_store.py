@@ -102,6 +102,82 @@ def test_coordinator_persists_on_key_change(tmp_path: Path) -> None:
         assert rows[1][2] is not None
 
 
+def test_upsert_song_collapses_shazam_then_audfprint_into_one_row(tmp_path: Path) -> None:
+    """A Shazam discovery followed by an audfprint match for the same track
+    must NOT create a second row. The existing row should absorb the
+    audfprint_track_id and have its source upgraded.
+
+    Regression for the 2026-05-30 dedupe sweep: prior to this fix, the upsert
+    keyed on (artist, title, source), so a Shazam row + a later audfprint
+    match (with the same artist/title but different source) coexisted and
+    every report counted the song twice.
+    """
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        first = store.upsert_song(artist="Garbage", title="Only Happy When It Rains", source="shazam")
+        second = store.upsert_song(
+            artist="Garbage",
+            title="Only Happy When It Rains",
+            audfprint_track_id="data/reference/songs/Garbage - Only Happy When It Rains.mp3",
+            source="audfprint",
+        )
+        assert first == second, "shazam+audfprint for the same song must reuse one row"
+
+        row = store.connection.execute(
+            "SELECT audfprint_track_id, source FROM songs WHERE id = ?", (first,)
+        ).fetchone()
+        assert row[0] == "data/reference/songs/Garbage - Only Happy When It Rains.mp3"
+        assert row[1] == "audfprint", "source should be upgraded once we have a reference file"
+
+        # And there's only one Garbage row, full stop.
+        n = store.connection.execute(
+            "SELECT COUNT(*) FROM songs WHERE artist = 'Garbage'"
+        ).fetchone()[0]
+        assert n == 1
+
+
+def test_upsert_song_is_case_insensitive(tmp_path: Path) -> None:
+    """Trivial casing/whitespace differences between Shazam and audfprint
+    titles must not produce two rows."""
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        a = store.upsert_song(artist="Evanescence", title="Bring Me to Life", source="shazam")
+        b = store.upsert_song(
+            artist="evanescence",
+            title="Bring Me To Life",  # casing differs
+            audfprint_track_id="evan.mp3",
+            source="audfprint",
+        )
+        c = store.upsert_song(
+            artist="  Evanescence  ",  # extra whitespace
+            title="  bring me to life  ",
+            source="shazam",
+        )
+        assert a == b == c
+
+        n = store.connection.execute(
+            "SELECT COUNT(*) FROM songs WHERE LOWER(artist) = 'evanescence'"
+        ).fetchone()[0]
+        assert n == 1
+
+
+def test_upsert_song_does_not_clobber_existing_audfprint_track_id(tmp_path: Path) -> None:
+    """If an existing row already has an audfprint_track_id, a subsequent
+    Shazam-only upsert must NOT wipe it back to NULL."""
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        first = store.upsert_song(
+            artist="Nirvana", title="Lithium", audfprint_track_id="ref.mp3", source="audfprint"
+        )
+        second = store.upsert_song(artist="Nirvana", title="Lithium", source="shazam")
+        assert first == second
+        row = store.connection.execute(
+            "SELECT audfprint_track_id, source FROM songs WHERE id = ?", (first,)
+        ).fetchone()
+        assert row[0] == "ref.mp3"
+        assert row[1] == "audfprint"
+
+
 def test_brand_mention_insert(tmp_path: Path) -> None:
     db = tmp_path / "rc.db"
     with BroadcastStore(db) as store:

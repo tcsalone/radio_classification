@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from radio_classifier.discovery.songs import DiscoveryRow
 from radio_classifier.reports.queries import (
+    ArtistRow,
     BrandRow,
     CommercialRow,
     SongRow,
@@ -72,13 +73,29 @@ def format_brands(rows: list[BrandRow]) -> str:
 
 
 def format_songs(rows: list[SongRow]) -> str:
-    headers = ["song_id", "artist", "title", "plays", "total"]
+    headers = ["song_id", "artist", "title", "spins", "segments", "total"]
     body = [
         [
             str(r.song_id) if r.song_id is not None else "?",
             r.artist or "?",
             r.title or "?",
-            str(r.play_count),
+            str(r.spin_count),
+            str(r.segment_count),
+            _format_seconds(r.total_duration_seconds),
+        ]
+        for r in rows
+    ]
+    return _render_table(headers, body)
+
+
+def format_artists(rows: list[ArtistRow]) -> str:
+    headers = ["artist", "spins", "titles", "segments", "total"]
+    body = [
+        [
+            r.artist,
+            str(r.spin_count),
+            str(r.distinct_titles),
+            str(r.segment_count),
             _format_seconds(r.total_duration_seconds),
         ]
         for r in rows
@@ -103,7 +120,7 @@ def format_timeline(rows: list[TimelineRow]) -> str:
 
 
 def format_discoveries(rows: list[DiscoveryRow]) -> str:
-    headers = ["id", "artist", "title", "plays", "last_heard", "tracklist"]
+    headers = ["id", "artist", "title", "plays", "last_heard", "tracklist", "review"]
     body = [
         [
             str(r.song_id),
@@ -112,6 +129,7 @@ def format_discoveries(rows: list[DiscoveryRow]) -> str:
             str(r.play_count),
             r.last_heard_utc or "-",
             "present" if r.in_tracklist else "missing",
+            "manual" if r.needs_review else "-",
         ]
         for r in rows
     ]

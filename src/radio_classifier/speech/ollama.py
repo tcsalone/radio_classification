@@ -61,13 +61,19 @@ class OllamaSpeechClassifier:
         self.model = model if model is not None else _default_model()
         self.include_fewshots = include_fewshots
         self.request_timeout = request_timeout
+        self._cache: dict[str, LlmClassificationJson] = {}
 
     def classify_transcript(self, text: str) -> LlmClassificationJson:
         """Return validated 5-class JSON; retry up to 3 times on failure."""
+        cache_key = _cache_key(text)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         last_err: Exception | None = None
         for attempt in range(3):
             try:
-                return self._classify_once(text)
+                result = self._classify_once(text)
+                self._cache[cache_key] = result
+                return result
             except (
                 OSError,
                 urllib.error.URLError,
@@ -109,3 +115,7 @@ class OllamaSpeechClassifier:
         else:
             obj = json.loads(content)
         return LlmClassificationJson.model_validate(obj)
+
+
+def _cache_key(text: str) -> str:
+    return " ".join(text.lower().split())

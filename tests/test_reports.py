@@ -9,8 +9,10 @@ import pytest
 
 from radio_classifier.persistence import BroadcastStore
 from radio_classifier.reports import (
+    artists_top,
     brands_top,
     commercials_top,
+    format_artists,
     format_brands,
     format_commercials,
     format_songs,
@@ -149,7 +151,306 @@ def test_songs_top_counts_plays(tmp_path: Path) -> None:
     store = _seed_db(tmp_path)
     try:
         rows = songs_top(store, since_utc=parse_since("1d"))
-        assert any(r.title == "Anti-Hero" and r.play_count == 2 for r in rows)
+        # Two distinct 3-minute plays starting 5 minutes apart should count
+        # as 2 spins and 2 segments. ``play_count`` is the legacy alias.
+        match = next(r for r in rows if r.title == "Anti-Hero")
+        assert match.spin_count == 2
+        assert match.segment_count == 2
+        assert match.play_count == match.segment_count
+    finally:
+        store.close()
+
+
+def test_songs_top_collapses_segments_within_gap_into_one_spin(tmp_path: Path) -> None:
+    """A song split into multiple short segments by a tiny gap should report
+    as ONE spin, with the segment count preserved for transparency.
+
+    This is the radio-industry "spins" notion: one airing of the track is
+    one spin regardless of how many DB rows the funnel produced for it.
+    """
+    store = BroadcastStore(tmp_path / "spins.db")
+    try:
+        song = store.upsert_song(artist="Linkin Park", title="Numb")
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=20)
+        # Three contiguous segments of "Numb" with a 5s gap between each —
+        # simulating brief Tier 1 dropouts mid-song. Total airtime ~3m20s.
+        offsets = [(0, 100), (105, 80), (190, 40)]
+        for off, dur in offsets:
+            start = base + timedelta(seconds=off)
+            end = start + timedelta(seconds=dur)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(end),
+                    category=BroadcastCategory.SONG,
+                    artist="Linkin Park",
+                    track_title="Numb",
+                    song_id=song,
+                )
+            )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        match = next(r for r in rows if r.title == "Numb")
+        assert match.spin_count == 1, "small gaps should not split a single spin"
+        assert match.segment_count == 3
+        assert match.total_duration_seconds == pytest.approx(100 + 80 + 40)
+    finally:
+        store.close()
+
+
+def test_songs_top_splits_far_apart_segments_into_separate_spins(tmp_path: Path) -> None:
+    """Two real plays of the same song separated by minutes should count as
+    two spins."""
+    store = BroadcastStore(tmp_path / "spins.db")
+    try:
+        song = store.upsert_song(artist="Nirvana", title="Lithium")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=2)
+        # First spin at base, second spin 30 minutes later. Each is one
+        # 3-minute segment.
+        for offset_min in (0, 30):
+            start = base + timedelta(minutes=offset_min)
+            end = start + timedelta(seconds=180)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(end),
+                    category=BroadcastCategory.SONG,
+                    artist="Nirvana",
+                    track_title="Lithium",
+                    song_id=song,
+                )
+            )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        match = next(r for r in rows if r.title == "Lithium")
+        assert match.spin_count == 2
+        assert match.segment_count == 2
+
+
+    finally:
+        store.close()
+
+
+def test_songs_top_orders_by_spins_then_airtime(tmp_path: Path) -> None:
+    """A song with more spins ranks above a song with more airtime."""
+    store = BroadcastStore(tmp_path / "spins.db")
+    try:
+        a = store.upsert_song(artist="Artist A", title="Two Spin Track")
+        b = store.upsert_song(artist="Artist B", title="One Long Track")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=2)
+
+        # Artist A: 2 spins of 2 minutes each = 4 minutes total
+        for offset_min in (0, 20):
+            start = base + timedelta(minutes=offset_min)
+            end = start + timedelta(seconds=120)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(end),
+                    category=BroadcastCategory.SONG,
+                    artist="Artist A",
+                    track_title="Two Spin Track",
+                    song_id=a,
+                )
+            )
+
+        # Artist B: 1 spin of 10 minutes
+        start = base + timedelta(minutes=40)
+        end = start + timedelta(seconds=600)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(start),
+                timestamp_end=_iso(end),
+                category=BroadcastCategory.SONG,
+                artist="Artist B",
+                track_title="One Long Track",
+                song_id=b,
+            )
+        )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        ordered_titles = [r.title for r in rows]
+        assert ordered_titles.index("Two Spin Track") < ordered_titles.index("One Long Track")
+    finally:
+        store.close()
+
+
+def test_artists_top_dedupes_case_and_sums_spins_across_titles(tmp_path: Path) -> None:
+    """Same artist with mixed casing collapses to one row and sums spins
+    across every title they had on air."""
+    store = BroadcastStore(tmp_path / "artists.db")
+    try:
+        # Two Foo Fighters songs, both with the "real" casing.
+        ff1 = store.upsert_song(artist="Foo Fighters", title="Times Like These")
+        ff2 = store.upsert_song(artist="Foo Fighters", title="The Pretender")
+        # Greenday with one song, written two different ways in the events to
+        # exercise case-fold dedup. We don't go through ``upsert_song`` here
+        # because we want the raw event artist string to vary; the LEFT JOIN
+        # with ``songs`` is what would otherwise normalize it.
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=2)
+
+        def _put(start: datetime, dur: int, *, artist: str, title: str, song_id: int | None) -> None:
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=dur)),
+                    category=BroadcastCategory.SONG,
+                    artist=artist,
+                    track_title=title,
+                    song_id=song_id,
+                )
+            )
+
+        # Foo Fighters: 1 spin of Times Like These (3 mins) + 1 spin of The
+        # Pretender (4 mins) — should report spins=2, titles=2.
+        _put(base, 180, artist="Foo Fighters", title="Times Like These", song_id=ff1)
+        _put(base + timedelta(minutes=10), 240, artist="Foo Fighters", title="The Pretender", song_id=ff2)
+
+        # Unidentified Greenday play with two casing variants in raw event
+        # text — should collapse to ONE artist row, with the casing that
+        # appears most frequently winning. We deliberately use song_id=None
+        # so the row goes through the raw-artist code path.
+        _put(base + timedelta(minutes=30), 60, artist="Green Day", title="Holiday", song_id=None)
+        _put(base + timedelta(minutes=31), 60, artist="green day", title="Holiday", song_id=None)
+        _put(base + timedelta(minutes=32), 60, artist="GREEN DAY", title="Holiday", song_id=None)
+
+        rows = artists_top(store, since_utc=parse_since("1d"))
+        by_artist = {r.artist.casefold(): r for r in rows}
+
+        ff_row = by_artist["foo fighters"]
+        assert ff_row.spin_count == 2
+        assert ff_row.distinct_titles == 2
+        assert ff_row.segment_count == 2
+        assert ff_row.total_duration_seconds == pytest.approx(180 + 240)
+
+        gd_row = by_artist["green day"]
+        # The 3 raw Green Day segments are 60s apart end-to-start (each lasts
+        # 60s and the next starts 60s later), so they collapse into ONE spin.
+        assert gd_row.spin_count == 1
+        assert gd_row.distinct_titles == 1
+        assert gd_row.segment_count == 3
+        assert gd_row.total_duration_seconds == pytest.approx(60 * 3)
+        # The "Green Day" variant is no more common than the other two — any
+        # of them is acceptable, but it must not be empty or weirdly-cased.
+        assert gd_row.artist.casefold() == "green day"
+
+        # Only Foo Fighters and Green Day should appear — no blank rows.
+        assert all(r.artist.strip() for r in rows)
+    finally:
+        store.close()
+
+
+def test_artists_top_orders_by_spins_then_airtime(tmp_path: Path) -> None:
+    """An artist with more spins must rank above one with more airtime."""
+    store = BroadcastStore(tmp_path / "artists.db")
+    try:
+        short_artist_song = store.upsert_song(artist="Sprinter", title="Two Spinners")
+        long_artist_song = store.upsert_song(artist="Marathoner", title="Single Long Track")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=2)
+
+        # Sprinter: 2 spins x 2 min each = 4 minutes airtime
+        for offset_min in (0, 30):
+            start = base + timedelta(minutes=offset_min)
+            end = start + timedelta(seconds=120)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(end),
+                    category=BroadcastCategory.SONG,
+                    artist="Sprinter",
+                    track_title="Two Spinners",
+                    song_id=short_artist_song,
+                )
+            )
+
+        # Marathoner: 1 spin x 12 min = more airtime, but only one spin
+        start = base + timedelta(minutes=60)
+        end = start + timedelta(seconds=720)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(start),
+                timestamp_end=_iso(end),
+                category=BroadcastCategory.SONG,
+                artist="Marathoner",
+                track_title="Single Long Track",
+                song_id=long_artist_song,
+            )
+        )
+
+        rows = artists_top(store, since_utc=parse_since("1d"))
+        artists_in_order = [r.artist for r in rows]
+        assert artists_in_order.index("Sprinter") < artists_in_order.index("Marathoner")
+    finally:
+        store.close()
+
+
+def test_artists_top_ignores_null_or_blank_artist(tmp_path: Path) -> None:
+    """SONG events with NULL or whitespace artist must not produce a row."""
+    store = BroadcastStore(tmp_path / "artists.db")
+    try:
+        named = store.upsert_song(artist="Real Artist", title="Real Track")
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=30)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=120)),
+                category=BroadcastCategory.SONG,
+                artist="Real Artist",
+                track_title="Real Track",
+                song_id=named,
+            )
+        )
+        # An unknown-song event with no artist at all.
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base + timedelta(minutes=5)),
+                timestamp_end=_iso(base + timedelta(minutes=6)),
+                category=BroadcastCategory.SONG,
+                artist=None,
+                track_title=None,
+                song_id=None,
+            )
+        )
+        # A whitespace-only artist (should also be skipped).
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base + timedelta(minutes=10)),
+                timestamp_end=_iso(base + timedelta(minutes=11)),
+                category=BroadcastCategory.SONG,
+                artist="   ",
+                track_title=None,
+                song_id=None,
+            )
+        )
+
+        rows = artists_top(store, since_utc=parse_since("1d"))
+        assert len(rows) == 1
+        assert rows[0].artist == "Real Artist"
+    finally:
+        store.close()
+
+
+def test_format_artists_renders_table(tmp_path: Path) -> None:
+    store = BroadcastStore(tmp_path / "artists.db")
+    try:
+        song = store.upsert_song(artist="The Cure", title="Friday I'm In Love")
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=200)),
+                category=BroadcastCategory.SONG,
+                artist="The Cure",
+                track_title="Friday I'm In Love",
+                song_id=song,
+            )
+        )
+        out = format_artists(artists_top(store, since_utc=parse_since("1d")))
+        assert "artist" in out
+        assert "spins" in out
+        assert "titles" in out
+        assert "segments" in out
+        assert "The Cure" in out
     finally:
         store.close()
 
@@ -187,5 +488,8 @@ def test_formatters_produce_tables(tmp_path: Path) -> None:
         for out in (out_c, out_b, out_s, out_t, out_sum):
             assert "\n" in out
             assert "(no rows)" not in out
+        # The songs table must surface the spin metric prominently.
+        assert "spins" in out_s
+        assert "segments" in out_s
     finally:
         store.close()

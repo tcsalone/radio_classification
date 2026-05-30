@@ -14,12 +14,20 @@ from radio_classifier.speech.types import (
 )
 
 _MIN_TRANSCRIPT_WORDS = 4
+# Phrases Whisper hallucinates onto silence / music / station-ID audio because
+# its training data included a lot of YouTube outros. Match in lowercase
+# substring form so the surrounding punctuation does not affect detection.
 _HALLUCINATION_PHRASES = (
     "thanks for watching",
     "thank you for watching",
     "like and subscribe",
     "subscribe to our channel",
     "see you next time",
+    "see you in the next video",
+    "see you in the next one",
+    "see you next video",
+    "see you in the next",
+    "see you next",
 )
 
 
