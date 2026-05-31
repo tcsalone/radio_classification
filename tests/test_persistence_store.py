@@ -161,6 +161,48 @@ def test_upsert_song_is_case_insensitive(tmp_path: Path) -> None:
         assert n == 1
 
 
+def test_upsert_song_prefers_canonical_artist_display_casing(tmp_path: Path) -> None:
+    """Known all-caps Shazam artist artifacts should be cleaned on write.
+
+    ``LINKIN PARK`` was observed in the 12-hour reports because Shazam often
+    returns the artist in all caps. The row should still dedupe
+    case-insensitively, but the stored display name should be the canonical
+    presentation.
+    """
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        first = store.upsert_song(artist="LINKIN PARK", title="Somewhere I Belong", source="shazam")
+        second = store.upsert_song(
+            artist="Linkin Park",
+            title="Somewhere I Belong",
+            audfprint_track_id="linkin.mp3",
+            source="audfprint",
+        )
+        assert first == second
+
+        row = store.connection.execute(
+            "SELECT artist, title, source, audfprint_track_id FROM songs WHERE id = ?",
+            (first,),
+        ).fetchone()
+        assert row[0] == "Linkin Park"
+        assert row[1] == "Somewhere I Belong"
+        assert row[2] == "audfprint"
+        assert row[3] == "linkin.mp3"
+
+
+def test_upsert_song_keeps_legitimate_artist_acronyms(tmp_path: Path) -> None:
+    """Do not title-case every all-caps artist, because names like AFI are real."""
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        song_id = store.upsert_song(artist="AFI", title="Miss Murder", source="shazam")
+        row = store.connection.execute(
+            "SELECT artist, title FROM songs WHERE id = ?",
+            (song_id,),
+        ).fetchone()
+        assert row[0] == "AFI"
+        assert row[1] == "Miss Murder"
+
+
 def test_upsert_song_does_not_clobber_existing_audfprint_track_id(tmp_path: Path) -> None:
     """If an existing row already has an audfprint_track_id, a subsequent
     Shazam-only upsert must NOT wipe it back to NULL."""

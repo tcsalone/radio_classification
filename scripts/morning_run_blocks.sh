@@ -15,12 +15,16 @@ set -euo pipefail
 #   (e.g. RTL-SDR not attached after a sleep/restart), it is logged to
 #   data/logs/<run-id>_skips.log and the loop continues with the next block.
 #   This avoids losing all subsequent blocks to one transient device hiccup.
+# - By default, classification is pipelined: while block N+1 is capturing,
+#   block N can classify in the background. Set CLASSIFY_PARALLEL=0 to restore
+#   the old capture-then-classify sequence.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BLOCK_COUNT="${1:-${BLOCK_COUNT:-4}}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-1800}"
+CLASSIFY_PARALLEL="${CLASSIFY_PARALLEL:-1}"
 
 RUN_DATE_UTC="$(date -u +%Y%m%d)"
 RUN_ID="morning_${RUN_DATE_UTC}_${BLOCK_COUNT}x$((BLOCK_SECONDS / 60))m"
@@ -34,6 +38,7 @@ echo "run_dir=$RUN_DIR"
 echo "db_path=$DB_PATH"
 echo "block_count=$BLOCK_COUNT"
 echo "block_seconds=$BLOCK_SECONDS"
+echo "classify_parallel=$CLASSIFY_PARALLEL"
 echo "skips_log=$SKIPS_LOG"
 
 .venv/bin/python -m radio_classifier db init --db-path "$DB_PATH" >/dev/null
@@ -43,6 +48,74 @@ echo "skips_log=$SKIPS_LOG"
 COMPLETED=0
 CAPTURE_FAILED=0
 CLASSIFY_FAILED=0
+PENDING_CLASSIFY_PID=""
+PENDING_CLASSIFY_BLOCK=""
+PENDING_CLASSIFY_LOG=""
+PENDING_CLASSIFY_TS=""
+
+wait_for_pending_classify() {
+  if [[ -z "$PENDING_CLASSIFY_PID" ]]; then
+    return 0
+  fi
+
+  echo
+  echo "=== block ${PENDING_CLASSIFY_BLOCK}/${BLOCK_COUNT} classify wait ==="
+  echo "log=$PENDING_CLASSIFY_LOG"
+  if wait "$PENDING_CLASSIFY_PID"; then
+    COMPLETED=$((COMPLETED + 1))
+  else
+    CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
+    echo "[${PENDING_CLASSIFY_TS}] block ${PENDING_CLASSIFY_BLOCK}: classify FAILED (see ${PENDING_CLASSIFY_LOG})" \
+      | tee -a "$SKIPS_LOG" >&2
+  fi
+
+  PENDING_CLASSIFY_PID=""
+  PENDING_CLASSIFY_BLOCK=""
+  PENDING_CLASSIFY_LOG=""
+  PENDING_CLASSIFY_TS=""
+}
+
+start_classify() {
+  local block_index="$1"
+  local wav_path="$2"
+  local cls_log="$3"
+  local block_start_ts="$4"
+
+  echo
+  echo "=== block ${block_index}/${BLOCK_COUNT} classify (into one DB) ==="
+  echo "db=$DB_PATH"
+  echo "log=$cls_log"
+
+  if [[ "$CLASSIFY_PARALLEL" == "1" ]]; then
+    (
+      .venv/bin/python -m radio_classifier classify \
+        -i "$wav_path" \
+        --enable-shazam \
+        --persist \
+        --db-path "$DB_PATH" \
+        --progress \
+        2>&1 | tee "$cls_log"
+    ) &
+    PENDING_CLASSIFY_PID="$!"
+    PENDING_CLASSIFY_BLOCK="$block_index"
+    PENDING_CLASSIFY_LOG="$cls_log"
+    PENDING_CLASSIFY_TS="$block_start_ts"
+  else
+    if .venv/bin/python -m radio_classifier classify \
+          -i "$wav_path" \
+          --enable-shazam \
+          --persist \
+          --db-path "$DB_PATH" \
+          --progress \
+          2>&1 | tee "$cls_log"; then
+      COMPLETED=$((COMPLETED + 1))
+    else
+      CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
+      echo "[${block_start_ts}] block ${block_index}: classify FAILED (see ${cls_log})" \
+        | tee -a "$SKIPS_LOG" >&2
+    fi
+  fi
+}
 
 for i in $(seq 1 "$BLOCK_COUNT"); do
   WAV_PATH="${RUN_DIR}/block${i}.wav"
@@ -76,25 +149,13 @@ for i in $(seq 1 "$BLOCK_COUNT"); do
     continue
   fi
 
-  echo
-  echo "=== block ${i}/${BLOCK_COUNT} classify (into one DB) ==="
-  echo "db=$DB_PATH"
-  echo "log=$CLS_LOG"
-  if ! .venv/bin/python -m radio_classifier classify \
-        -i "$WAV_PATH" \
-        --enable-shazam \
-        --persist \
-        --db-path "$DB_PATH" \
-        --progress \
-        2>&1 | tee "$CLS_LOG"; then
-    CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
-    echo "[${BLOCK_START_TS}] block ${i}: classify FAILED (see ${CLS_LOG})" \
-      | tee -a "$SKIPS_LOG" >&2
-    continue
-  fi
-
-  COMPLETED=$((COMPLETED + 1))
+  # Keep at most one classifier alive. In parallel mode this wait usually
+  # happens after the next block's capture, so capture and classify overlap.
+  wait_for_pending_classify
+  start_classify "$i" "$WAV_PATH" "$CLS_LOG" "$BLOCK_START_TS"
 done
+
+wait_for_pending_classify
 
 echo
 echo "=== run summary ==="

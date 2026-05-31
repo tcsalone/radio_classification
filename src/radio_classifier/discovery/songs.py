@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Iterator
 
 from radio_classifier.persistence.broadcast_store import BroadcastStore
@@ -342,9 +343,25 @@ def _tracklist_contains(
     return False
 
 
+_FEATURE_SUFFIX_RE = re.compile(
+    r"\s*(?:\(|\[)\s*(?:feat\.?|featuring|ft\.?|with)\b.*?(?:\)|\])\s*$",
+    re.IGNORECASE,
+)
+
+
 def _norm(value: str | None) -> str | None:
-    """Wrapper around :func:`normalize_token` so ``None`` flows through cleanly."""
-    return normalize_token(value) if value else None
+    """Normalize a tracklist/discovery field for containment checks.
+
+    Shazam often returns typographic apostrophes or a featured-artist suffix
+    while our curated tracklist stores simpler titles. For "already indexed?"
+    checks those should compare equal, so ``Who's`` == ``who’s`` and
+    ``Go Away (feat. Best Coast)`` == ``Go Away``.
+    """
+    if not value:
+        return None
+    cleaned = value.replace("’", "'").replace("‘", "'")
+    cleaned = _FEATURE_SUFFIX_RE.sub("", cleaned)
+    return normalize_token(cleaned)
 
 
 def _normalize_dedupe_key(artist: str | None, title: str | None) -> tuple[str, str]:

@@ -13,6 +13,17 @@ from datetime import datetime, timedelta, timezone
 
 from radio_classifier.persistence.broadcast_store import BroadcastStore
 
+PROMO_MAX_SPIN_SECONDS: float = 90.0
+"""Spin durations shorter than this are treated as station-promo clips.
+
+Stations frequently air 10-60 second slices of an upcoming track as a teaser
+("hear Julia Wolf next on Live 105"). Those snippets land in the same
+``broadcast_events`` table as real plays and can inflate spin counts 10x.
+We don't have ground-truth song length, so the threshold is a heuristic:
+real radio plays of typical songs run well above 90 seconds, and promo
+clips almost never exceed it.
+"""
+
 
 _DURATION_RE = re.compile(r"^\s*(\d+)\s*([smhd])\s*$", re.IGNORECASE)
 
@@ -100,13 +111,39 @@ class SongRow:
     artist: str | None
     title: str | None
     spin_count: int
+    promo_spin_count: int
     segment_count: int
     total_duration_seconds: float
+    promo_duration_seconds: float
 
     # Compatibility alias for older call sites that read ``play_count``.
     @property
     def play_count(self) -> int:
         return self.segment_count
+
+    @property
+    def full_spin_count(self) -> int:
+        """Spins that exceeded :data:`PROMO_MAX_SPIN_SECONDS` (i.e. real plays)."""
+        return max(0, self.spin_count - self.promo_spin_count)
+
+    @property
+    def is_promo_only(self) -> bool:
+        """True when every detected spin looked like a station promo clip."""
+        return self.spin_count > 0 and self.spin_count == self.promo_spin_count
+
+
+@dataclass
+class SongTimelineRow:
+    """One SONG event in chronological order."""
+
+    start_utc: str
+    end_utc: str | None
+    duration_seconds: float | None
+    song_id: int | None
+    artist: str | None
+    title: str | None
+    confidence: float | None
+    detection_source: str
 
 
 SPIN_MERGE_GAP_SECONDS: float = 60.0
@@ -130,30 +167,82 @@ class ArtistRow:
 
     artist: str
     spin_count: int
+    promo_spin_count: int
     distinct_titles: int
     segment_count: int
     total_duration_seconds: float
+    promo_duration_seconds: float
+
+    @property
+    def full_spin_count(self) -> int:
+        return max(0, self.spin_count - self.promo_spin_count)
+
+    @property
+    def is_promo_only(self) -> bool:
+        return self.spin_count > 0 and self.spin_count == self.promo_spin_count
+
+
+@dataclass
+class SpinStats:
+    """Per-song spin tally with a separate promo subtotal.
+
+    ``spin_count`` is the total number of distinct plays after collapsing
+    short-gap segments; ``promo_spin_count`` counts the subset whose total
+    spin duration is below :data:`PROMO_MAX_SPIN_SECONDS`. The corresponding
+    durations tell us how much of the airtime was just promo clips vs full
+    plays.
+    """
+
+    spin_count: int = 0
+    promo_spin_count: int = 0
+    total_duration_seconds: float = 0.0
+    promo_duration_seconds: float = 0.0
+
+    def add(self, other: "SpinStats") -> None:
+        self.spin_count += other.spin_count
+        self.promo_spin_count += other.promo_spin_count
+        self.total_duration_seconds += other.total_duration_seconds
+        self.promo_duration_seconds += other.promo_duration_seconds
 
 
 def _count_spins(
     segments: list[tuple[str, str | None, float | None]],
     gap_seconds: float,
-) -> tuple[int, float]:
-    """Walk one song's segments in start-order, return ``(spins, total_airtime)``.
+    *,
+    promo_max_spin_seconds: float = PROMO_MAX_SPIN_SECONDS,
+) -> SpinStats:
+    """Walk one song's segments in start-order and return a :class:`SpinStats`.
 
     Consecutive segments separated by less than ``gap_seconds`` of wall-clock
     silence are folded into the same spin. Overlapping segments (which can
     happen with the sliding-window classifier) count as zero gap, never as a
     negative gap that would force a spurious split.
+
+    Each completed spin shorter than ``promo_max_spin_seconds`` is tallied
+    separately as a promo clip. The full counts and durations always include
+    those promo spins so existing report consumers see the same headline
+    numbers.
     """
-    spin_count = 0
+    stats = SpinStats()
+    current_duration = 0.0
     prev_end_iso: str | None = None
-    total_duration = 0.0
+
+    def _close_spin(duration: float) -> None:
+        if duration <= 0:
+            return
+        stats.spin_count += 1
+        stats.total_duration_seconds += duration
+        if duration < promo_max_spin_seconds:
+            stats.promo_spin_count += 1
+            stats.promo_duration_seconds += duration
+
     for start_iso, end_iso, dur in segments:
         dur_f = float(dur or 0.0)
-        total_duration += dur_f
         if prev_end_iso is None or _gap_seconds(prev_end_iso, start_iso) > gap_seconds:
-            spin_count += 1
+            _close_spin(current_duration)
+            current_duration = dur_f
+        else:
+            current_duration += dur_f
         if end_iso is not None:
             prev_end_iso = end_iso
         elif dur_f > 0:
@@ -161,7 +250,8 @@ def _count_spins(
             prev_end_iso = _iso(derived_end)
         else:
             prev_end_iso = start_iso
-    return spin_count, total_duration
+    _close_spin(current_duration)
+    return stats
 
 
 @dataclass
@@ -308,23 +398,85 @@ def songs_top(
     songs: list[SongRow] = []
     for key in order:
         segments = bucket[key]
-        spin_count, total_duration = _count_spins(segments, gap)
+        stats = _count_spins(segments, gap)
         songs.append(
             SongRow(
                 song_id=key[0],
                 artist=key[1],
                 title=key[2],
-                spin_count=spin_count,
+                spin_count=stats.spin_count,
+                promo_spin_count=stats.promo_spin_count,
                 segment_count=len(segments),
-                total_duration_seconds=total_duration,
+                total_duration_seconds=stats.total_duration_seconds,
+                promo_duration_seconds=stats.promo_duration_seconds,
             )
         )
 
-    songs.sort(
-        key=lambda s: (s.spin_count, s.total_duration_seconds, s.segment_count),
-        reverse=True,
-    )
+    # Sort by *real* (non-promo) spins first so promo-only entries fall to the
+    # bottom of the list even when their raw ``spin_count`` is large. Ties
+    # break by non-promo airtime so two songs with identical real-spin counts
+    # are ordered by how much genuine play time they got (not by how many
+    # promo clips they collected). Total airtime and segment count are
+    # appended as final tiebreakers to preserve stable behaviour for legacy
+    # data that has no promo spins.
+    def _sort_key(s: SongRow) -> tuple:
+        full_airtime = s.total_duration_seconds - s.promo_duration_seconds
+        return (
+            s.full_spin_count,
+            full_airtime,
+            s.spin_count,
+            s.total_duration_seconds,
+            s.segment_count,
+        )
+
+    songs.sort(key=_sort_key, reverse=True)
     return songs[: max(0, int(top_n))]
+
+
+def songs_timeline(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    limit: int = 500,
+) -> list[SongTimelineRow]:
+    """Return SONG events in broadcast order.
+
+    Unlike :func:`songs_top`, this intentionally does not collapse segments into
+    spins. It is a raw chronological listening log for manual review and
+    debugging.
+    """
+    rows = store.connection.execute(
+        """
+        SELECT
+            e.timestamp_start,
+            e.timestamp_end,
+            e.duration,
+            e.song_id,
+            COALESCE(s.artist, e.artist) AS artist,
+            COALESCE(s.title, e.track_title) AS title,
+            e.confidence,
+            COALESCE(s.source, 'unknown') AS detection_source
+        FROM broadcast_events e
+        LEFT JOIN songs s ON e.song_id = s.id
+        WHERE e.category = 'SONG' AND e.timestamp_start >= ?
+        ORDER BY e.timestamp_start ASC
+        LIMIT ?
+        """,
+        (since_utc, limit),
+    ).fetchall()
+    return [
+        SongTimelineRow(
+            start_utc=str(r[0]),
+            end_utc=r[1],
+            duration_seconds=(float(r[2]) if r[2] is not None else None),
+            song_id=r[3],
+            artist=r[4],
+            title=r[5],
+            confidence=(float(r[6]) if r[6] is not None else None),
+            detection_source=str(r[7] or "unknown"),
+        )
+        for r in rows
+    ]
 
 
 def _artist_dedupe_key(artist: str) -> str:
@@ -413,28 +565,41 @@ def artists_top(
     for key in per_artist_order:
         titles = per_artist_titles[key]
         casing = per_artist_casing[key]
-        total_spins = 0
-        total_duration = 0.0
+        agg = SpinStats()
         total_segments = 0
         for segments in titles.values():
-            spins, dur = _count_spins(segments, gap)
-            total_spins += spins
-            total_duration += dur
+            agg.add(_count_spins(segments, gap))
             total_segments += len(segments)
         display = casing.most_common(1)[0][0] if casing else key
         rows.append(
             ArtistRow(
                 artist=display,
-                spin_count=total_spins,
+                spin_count=agg.spin_count,
+                promo_spin_count=agg.promo_spin_count,
                 distinct_titles=len(titles),
                 segment_count=total_segments,
-                total_duration_seconds=total_duration,
+                total_duration_seconds=agg.total_duration_seconds,
+                promo_duration_seconds=agg.promo_duration_seconds,
             )
         )
 
-    rows.sort(
-        key=lambda r: (-r.spin_count, -r.total_duration_seconds, -r.distinct_titles, r.artist.casefold()),
-    )
+    # Mirror ``songs_top``: order by real (non-promo) spins first so artists
+    # whose airtime is dominated by station promos don't outrank artists with
+    # a single genuine play. Non-promo airtime is the next tiebreaker so two
+    # artists with identical real spin counts sort by how much real airtime
+    # they accumulated, not by promo clip volume.
+    def _artist_sort_key(r: ArtistRow) -> tuple:
+        full_airtime = r.total_duration_seconds - r.promo_duration_seconds
+        return (
+            -r.full_spin_count,
+            -full_airtime,
+            -r.spin_count,
+            -r.total_duration_seconds,
+            -r.distinct_titles,
+            r.artist.casefold(),
+        )
+
+    rows.sort(key=_artist_sort_key)
     return rows[: max(0, int(top_n))]
 
 

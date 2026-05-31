@@ -32,6 +32,7 @@ def test_help_lists_subcommands() -> None:
         "report",
         "seed",
         "songs",
+        "commercials",
     ):
         assert sub in out, f"missing subcommand {sub} in --help"
 
@@ -41,6 +42,13 @@ def test_fingerprint_index_help_documents_rebuild_default() -> None:
     assert proc.returncode == 0, proc.stderr
     assert "REBUILT" in proc.stdout
     assert "--extend" in proc.stdout
+
+
+def test_classify_help_documents_audfprint_min_count() -> None:
+    proc = _run("classify", "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "--audfprint-min-count" in proc.stdout
+    assert "default: 45" in proc.stdout
 
 
 def test_fingerprint_index_rebuilds_existing_index_by_default(
@@ -179,6 +187,14 @@ def test_report_help_lists_artists_subcommand() -> None:
     proc = _run("report", "--help")
     assert proc.returncode == 0, proc.stderr
     assert "artists" in proc.stdout
+    assert "songs-timeline" in proc.stdout
+    assert "dashboard" in proc.stdout
+
+
+def test_commercials_help_lists_dedupe_subcommand() -> None:
+    proc = _run("commercials", "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "dedupe" in proc.stdout
 
 
 def test_report_artists_runs_against_v2_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,6 +235,92 @@ def test_report_artists_runs_against_v2_db(tmp_path: Path, monkeypatch: pytest.M
     assert "spins" in proc.stdout
     assert "titles" in proc.stdout
     assert "Linkin Park" in proc.stdout
+
+
+def test_report_songs_timeline_runs_against_v2_db(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from radio_classifier.cli import main as cli_main
+    from radio_classifier.persistence import BroadcastStore
+    from radio_classifier.segments.types import BroadcastCategory, SegmentTransition
+
+    db_path = tmp_path / "rc.db"
+    rc = cli_main(["db", "init", "--db-path", str(db_path)])
+    assert rc == 0
+
+    base = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+
+    def _iso(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    with BroadcastStore(db_path) as store:
+        song = store.upsert_song(artist="Nirvana", title="Lithium", source="shazam")
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=180)),
+                category=BroadcastCategory.SONG,
+                artist="Nirvana",
+                track_title="Lithium",
+                song_id=song,
+                confidence=0.91,
+            )
+        )
+
+    proc = _run("report", "songs-timeline", "--db-path", str(db_path), "--since", "1d")
+    assert proc.returncode == 0, proc.stderr
+    assert "start_utc" in proc.stdout
+    assert "source" in proc.stdout
+    assert "Nirvana" in proc.stdout
+    assert "Lithium" in proc.stdout
+    assert "shazam" in proc.stdout
+
+
+def test_report_dashboard_writes_html(tmp_path: Path) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from radio_classifier.cli import main as cli_main
+    from radio_classifier.persistence import BroadcastStore
+    from radio_classifier.segments.types import BroadcastCategory, SegmentTransition
+
+    db_path = tmp_path / "rc.db"
+    out_path = tmp_path / "dashboard.html"
+    rc = cli_main(["db", "init", "--db-path", str(db_path)])
+    assert rc == 0
+
+    base = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+
+    def _iso(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    with BroadcastStore(db_path) as store:
+        song = store.upsert_song(artist="Green Day", title="Holiday")
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=180)),
+                category=BroadcastCategory.SONG,
+                artist="Green Day",
+                track_title="Holiday",
+                song_id=song,
+            )
+        )
+
+    proc = _run(
+        "report",
+        "dashboard",
+        "--db-path",
+        str(db_path),
+        "--since",
+        "1d",
+        "--out",
+        str(out_path),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert out_path.exists()
+    body = out_path.read_text(encoding="utf-8")
+    assert "Broadcast Metrics Dashboard" in body
+    assert "Green Day" in body
 
 
 def test_classify_help_lists_progress_flags() -> None:

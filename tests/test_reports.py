@@ -16,9 +16,12 @@ from radio_classifier.reports import (
     format_brands,
     format_commercials,
     format_songs,
+    format_songs_timeline,
     format_summary,
     format_timeline,
     parse_since,
+    render_dashboard_html,
+    songs_timeline,
     songs_top,
     summary,
     timeline,
@@ -231,6 +234,203 @@ def test_songs_top_splits_far_apart_segments_into_separate_spins(tmp_path: Path)
         store.close()
 
 
+def test_songs_top_flags_short_clip_spins_as_promos(tmp_path: Path) -> None:
+    """A song that the station only ever plays as 10-60 second teaser clips
+    should be tagged as promo-only.
+
+    This is the Julia Wolf pattern observed in the morning 12-hour run: 11
+    spins averaging 41 seconds each is unmistakably a station promo, not
+    eleven full plays. We expect ``spin_count`` to still match the raw
+    play tally so existing dashboards don't lose data, but ``promo_spin_count``
+    should equal it and ``full_spin_count`` / ``is_promo_only`` should reflect
+    that none of those spins look like real airings.
+    """
+    store = BroadcastStore(tmp_path / "promos.db")
+    try:
+        song = store.upsert_song(artist="Julia Wolf", title="In My Room (Acoustic)")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=4)
+        # Three well-separated promo windows, each only 30 seconds long.
+        # The gap between them (>30 minutes) keeps them as separate spins.
+        for offset_min in (0, 45, 120):
+            start = base + timedelta(minutes=offset_min)
+            end = start + timedelta(seconds=30)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(end),
+                    category=BroadcastCategory.SONG,
+                    artist="Julia Wolf",
+                    track_title="In My Room (Acoustic)",
+                    song_id=song,
+                )
+            )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        match = next(r for r in rows if r.title == "In My Room (Acoustic)")
+        assert match.spin_count == 3
+        assert match.promo_spin_count == 3
+        assert match.full_spin_count == 0
+        assert match.is_promo_only is True
+        assert match.promo_duration_seconds == pytest.approx(90.0)
+        assert match.total_duration_seconds == pytest.approx(90.0)
+    finally:
+        store.close()
+
+
+def test_songs_top_counts_long_and_short_spins_separately(tmp_path: Path) -> None:
+    """A real song with one full play and one short teaser should report
+    both, with the promo subtotal isolated for filtering."""
+    store = BroadcastStore(tmp_path / "promos.db")
+    try:
+        song = store.upsert_song(artist="Tame Impala", title="Dracula")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=2)
+        # One genuine 3m20s play.
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=200)),
+                category=BroadcastCategory.SONG,
+                artist="Tame Impala",
+                track_title="Dracula",
+                song_id=song,
+            )
+        )
+        # A 25-second teaser an hour later — should be flagged as promo only.
+        teaser_start = base + timedelta(minutes=60)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(teaser_start),
+                timestamp_end=_iso(teaser_start + timedelta(seconds=25)),
+                category=BroadcastCategory.SONG,
+                artist="Tame Impala",
+                track_title="Dracula",
+                song_id=song,
+            )
+        )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        match = next(r for r in rows if r.title == "Dracula")
+        assert match.spin_count == 2
+        assert match.promo_spin_count == 1
+        assert match.full_spin_count == 1
+        assert match.is_promo_only is False
+        assert match.promo_duration_seconds == pytest.approx(25.0)
+        assert match.total_duration_seconds == pytest.approx(225.0)
+    finally:
+        store.close()
+
+
+def test_songs_top_tiebreaks_equal_real_spins_by_non_promo_airtime(tmp_path: Path) -> None:
+    """Two songs with identical full_spin_count should sort by non-promo
+    airtime, not by total (promo-inflated) airtime.
+
+    This catches a real bug observed against the 12-hour DB: Royel Otis with
+    3 clean spins (~8 minutes) should outrank Julia Wolf with 3 marginal
+    spins + 8 promo clips (~3 minutes of real airtime padded to ~7m30s by
+    teasers).
+    """
+    store = BroadcastStore(tmp_path / "tiebreak.db")
+    try:
+        clean = store.upsert_song(artist="Royel Otis", title="Clean Song")
+        padded = store.upsert_song(artist="Promo Heavy", title="Padded Song")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=4)
+
+        # Clean Song: 3 full plays of 160s each => 8m00s of real airtime.
+        for i, offset_min in enumerate((0, 30, 60)):
+            start = base + timedelta(minutes=offset_min)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=160)),
+                    category=BroadcastCategory.SONG,
+                    artist="Royel Otis",
+                    track_title="Clean Song",
+                    song_id=clean,
+                )
+            )
+
+        # Padded Song: 3 full plays of 100s + 8 promo clips of 20s each.
+        for offset_min in (0, 35, 70):
+            start = base + timedelta(minutes=offset_min)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=100)),
+                    category=BroadcastCategory.SONG,
+                    artist="Promo Heavy",
+                    track_title="Padded Song",
+                    song_id=padded,
+                )
+            )
+        for i in range(8):
+            promo_start = base + timedelta(minutes=120 + 8 * i)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(promo_start),
+                    timestamp_end=_iso(promo_start + timedelta(seconds=20)),
+                    category=BroadcastCategory.SONG,
+                    artist="Promo Heavy",
+                    track_title="Padded Song",
+                    song_id=padded,
+                )
+            )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        order = [r.title for r in rows]
+        clean_row = next(r for r in rows if r.title == "Clean Song")
+        padded_row = next(r for r in rows if r.title == "Padded Song")
+        assert clean_row.full_spin_count == padded_row.full_spin_count == 3
+        # Real airtime is what should decide the order.
+        assert order.index("Clean Song") < order.index("Padded Song")
+    finally:
+        store.close()
+
+
+def test_songs_top_ranks_real_spins_above_promo_only_songs(tmp_path: Path) -> None:
+    """A song with one real spin must outrank a promo-only song even when
+    the promo-only one has more raw spin_count.
+
+    Without the promo-aware sort, ``promo_spin_count=10`` would push station
+    teasers to the top of the report.
+    """
+    store = BroadcastStore(tmp_path / "promos.db")
+    try:
+        real = store.upsert_song(artist="Real Band", title="Real Song")
+        promo = store.upsert_song(artist="Promo Band", title="Promo Song")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=3)
+
+        # Real Band: one 4-minute spin.
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=240)),
+                category=BroadcastCategory.SONG,
+                artist="Real Band",
+                track_title="Real Song",
+                song_id=real,
+            )
+        )
+        # Promo Band: ten 30-second clips, well-separated.
+        for i in range(10):
+            promo_start = base + timedelta(minutes=10 + 12 * i)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(promo_start),
+                    timestamp_end=_iso(promo_start + timedelta(seconds=30)),
+                    category=BroadcastCategory.SONG,
+                    artist="Promo Band",
+                    track_title="Promo Song",
+                    song_id=promo,
+                )
+            )
+
+        rows = songs_top(store, since_utc=parse_since("1d"))
+        order = [r.title for r in rows]
+        assert order.index("Real Song") < order.index("Promo Song")
+    finally:
+        store.close()
+
+
 def test_songs_top_orders_by_spins_then_airtime(tmp_path: Path) -> None:
     """A song with more spins ranks above a song with more airtime."""
     store = BroadcastStore(tmp_path / "spins.db")
@@ -336,6 +536,64 @@ def test_artists_top_dedupes_case_and_sums_spins_across_titles(tmp_path: Path) -
 
         # Only Foo Fighters and Green Day should appear — no blank rows.
         assert all(r.artist.strip() for r in rows)
+    finally:
+        store.close()
+
+
+def test_artists_top_separates_promo_spins_from_real_spins(tmp_path: Path) -> None:
+    """An artist whose only airtime is promo clips reports
+    ``full_spin_count=0`` and ``is_promo_only`` is true, even when
+    ``spin_count`` is non-zero."""
+    store = BroadcastStore(tmp_path / "promo_artist.db")
+    try:
+        promo = store.upsert_song(artist="Julia Wolf", title="In My Room (Acoustic)")
+        real = store.upsert_song(artist="The Killers", title="Somebody Told Me")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=4)
+
+        # Two 30-second promos for Julia Wolf, well-separated.
+        for offset_min in (0, 30):
+            start = base + timedelta(minutes=offset_min)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=30)),
+                    category=BroadcastCategory.SONG,
+                    artist="Julia Wolf",
+                    track_title="In My Room (Acoustic)",
+                    song_id=promo,
+                )
+            )
+        # One full 3-minute play of a Killers song.
+        killer_start = base + timedelta(minutes=70)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(killer_start),
+                timestamp_end=_iso(killer_start + timedelta(seconds=180)),
+                category=BroadcastCategory.SONG,
+                artist="The Killers",
+                track_title="Somebody Told Me",
+                song_id=real,
+            )
+        )
+
+        rows = artists_top(store, since_utc=parse_since("1d"))
+        by_artist = {r.artist.casefold(): r for r in rows}
+
+        julia = by_artist["julia wolf"]
+        assert julia.spin_count == 2
+        assert julia.promo_spin_count == 2
+        assert julia.full_spin_count == 0
+        assert julia.is_promo_only is True
+
+        killers = by_artist["the killers"]
+        assert killers.spin_count == 1
+        assert killers.promo_spin_count == 0
+        assert killers.full_spin_count == 1
+        assert killers.is_promo_only is False
+
+        order = [r.artist for r in rows]
+        # Real spin must outrank promo-only artist.
+        assert order.index("The Killers") < order.index("Julia Wolf")
     finally:
         store.close()
 
@@ -448,9 +706,47 @@ def test_format_artists_renders_table(tmp_path: Path) -> None:
         out = format_artists(artists_top(store, since_utc=parse_since("1d")))
         assert "artist" in out
         assert "spins" in out
+        assert "promos" in out
         assert "titles" in out
         assert "segments" in out
         assert "The Cure" in out
+    finally:
+        store.close()
+
+
+def test_format_songs_and_artists_decorate_promo_only_entries(tmp_path: Path) -> None:
+    """A promo-only song should render with a ``[promo]`` tag in both the
+    songs and artists tables, and the ``spins`` column should call out the
+    promo subtotal so the headline number isn't misleading."""
+    store = BroadcastStore(tmp_path / "promo_fmt.db")
+    try:
+        song = store.upsert_song(artist="Julia Wolf", title="In My Room (Acoustic)")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=3)
+        for offset_min in (0, 45, 90):
+            start = base + timedelta(minutes=offset_min)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=30)),
+                    category=BroadcastCategory.SONG,
+                    artist="Julia Wolf",
+                    track_title="In My Room (Acoustic)",
+                    song_id=song,
+                )
+            )
+
+        song_out = format_songs(songs_top(store, since_utc=parse_since("1d")))
+        artist_out = format_artists(artists_top(store, since_utc=parse_since("1d")))
+
+        # The headline "spins" cell shows zero real spins plus a "(+3)" hint;
+        # the title and artist labels carry a [promo] marker.
+        assert "0 (+3)" in song_out
+        assert "[promo]" in song_out
+        assert "In My Room (Acoustic)" in song_out
+
+        assert "0 (+3)" in artist_out
+        assert "[promo]" in artist_out
+        assert "Julia Wolf" in artist_out
     finally:
         store.close()
 
@@ -461,6 +757,46 @@ def test_timeline_returns_chronological(tmp_path: Path) -> None:
         rows = timeline(store, since_utc=parse_since("1d"))
         starts = [r.start_utc for r in rows]
         assert starts == sorted(starts)
+    finally:
+        store.close()
+
+
+def test_songs_timeline_returns_song_events_only_in_chronological_order(tmp_path: Path) -> None:
+    store = _seed_db(tmp_path)
+    try:
+        rows = songs_timeline(store, since_utc=parse_since("1d"), limit=10)
+        assert len(rows) == 2
+        assert [r.start_utc for r in rows] == sorted(r.start_utc for r in rows)
+        assert {r.title for r in rows} == {"Anti-Hero"}
+        assert all(r.detection_source == "audfprint" for r in rows)
+        assert all(r.duration_seconds == pytest.approx(180.0) for r in rows)
+    finally:
+        store.close()
+
+
+def test_songs_timeline_includes_unknown_song_rows(tmp_path: Path) -> None:
+    store = BroadcastStore(tmp_path / "song-timeline.db")
+    try:
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=10)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(base),
+                timestamp_end=_iso(base + timedelta(seconds=10)),
+                category=BroadcastCategory.SONG,
+                artist=None,
+                track_title=None,
+                song_id=None,
+                confidence=0.95,
+            )
+        )
+
+        rows = songs_timeline(store, since_utc=parse_since("1d"))
+        assert len(rows) == 1
+        assert rows[0].song_id is None
+        assert rows[0].artist is None
+        assert rows[0].title is None
+        assert rows[0].detection_source == "unknown"
+        assert rows[0].confidence == pytest.approx(0.95)
     finally:
         store.close()
 
@@ -483,13 +819,68 @@ def test_formatters_produce_tables(tmp_path: Path) -> None:
         out_c = format_commercials(commercials_top(store, since_utc=parse_since("1d")))
         out_b = format_brands(brands_top(store, since_utc=parse_since("1d")))
         out_s = format_songs(songs_top(store, since_utc=parse_since("1d")))
+        out_st = format_songs_timeline(songs_timeline(store, since_utc=parse_since("1d")))
         out_t = format_timeline(timeline(store, since_utc=parse_since("1d")))
         out_sum = format_summary(summary(store, since_utc=parse_since("1d")))
-        for out in (out_c, out_b, out_s, out_t, out_sum):
+        for out in (out_c, out_b, out_s, out_st, out_t, out_sum):
             assert "\n" in out
             assert "(no rows)" not in out
         # The songs table must surface the spin metric prominently.
         assert "spins" in out_s
         assert "segments" in out_s
+        assert "start_utc" in out_st
+        assert "source" in out_st
+    finally:
+        store.close()
+
+
+def test_dashboard_renders_static_html_with_core_sections(tmp_path: Path) -> None:
+    store = _seed_db(tmp_path)
+    try:
+        html = render_dashboard_html(store, since_utc=parse_since("1d"), top_n=5)
+        assert "<!doctype html>" in html
+        assert "Broadcast Metrics Dashboard" in html
+        assert "Category Airtime" in html
+        assert "Top Artists" in html
+        assert "Top Songs" in html
+        assert "Top Brands" in html
+        assert "Top Commercials" in html
+        assert "Hourly Category Mix" in html
+        assert "Taylor Swift" in html
+        assert "Geico" in html
+        # Promo columns are always present in the rendered table headers, even
+        # when the seed DB has no promo-shaped spins (Anti-Hero is a full
+        # 3-minute play, so it stays out of the promo bucket).
+        assert "Promos" in html
+    finally:
+        store.close()
+
+
+def test_dashboard_highlights_promo_only_entries(tmp_path: Path) -> None:
+    """Promo-only songs/artists render with the visual promo annotation."""
+    store = BroadcastStore(tmp_path / "promo_dash.db")
+    try:
+        song = store.upsert_song(artist="Julia Wolf", title="In My Room (Acoustic)")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=3)
+        for offset_min in (0, 30, 60):
+            start = base + timedelta(minutes=offset_min)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=30)),
+                    category=BroadcastCategory.SONG,
+                    artist="Julia Wolf",
+                    track_title="In My Room (Acoustic)",
+                    song_id=song,
+                )
+            )
+
+        html = render_dashboard_html(store, since_utc=parse_since("1d"), top_n=5)
+        # The [promo] decoration and the "+3 promo" pill should both land in
+        # the song/artist tables (HTML-escaped or not).
+        assert "promo-tag" in html
+        assert "promo-pill" in html
+        assert "+3 promo" in html
+        assert "[promo]" in html
     finally:
         store.close()

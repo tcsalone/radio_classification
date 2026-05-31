@@ -10,6 +10,65 @@ from radio_classifier.segments.reducer import duration_seconds
 from radio_classifier.segments.types import SegmentTransition
 
 
+_ARTIST_DISPLAY_ALIASES = {
+    "linkin park": "Linkin Park",
+}
+
+
+def _display_key(value: str | None) -> str:
+    return " ".join((value or "").strip().split()).casefold()
+
+
+def _display_value(value: str | None, *, aliases: dict[str, str] | None = None) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(value.strip().split())
+    if not cleaned:
+        return value
+    if aliases:
+        alias = aliases.get(_display_key(cleaned))
+        if alias is not None:
+            return alias
+    return cleaned
+
+
+def _has_lowercase_letter(value: str | None) -> bool:
+    return any(ch.isalpha() and ch.islower() for ch in value or "")
+
+
+def _prefer_display_value(
+    existing: str | None,
+    incoming: str | None,
+    *,
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    """Pick the least-noisy display value without changing song identity.
+
+    ``upsert_song`` matches case-insensitively, so this helper only decides
+    what text to keep on the canonical row. Explicit aliases fix known
+    artifacts such as Shazam's ``LINKIN PARK``. Otherwise, a mixed-case
+    incoming reference value can replace an all-caps existing value, while
+    legitimate acronyms like ``AFI`` stay untouched unless an alias says
+    otherwise.
+    """
+
+    existing_clean = _display_value(existing, aliases=aliases)
+    incoming_clean = _display_value(incoming, aliases=aliases)
+    if existing_clean is None or existing_clean == "":
+        return incoming_clean
+    if incoming_clean is None or incoming_clean == "":
+        return existing_clean
+    if existing_clean == incoming_clean:
+        return existing_clean
+    if _display_key(existing_clean) != _display_key(incoming_clean):
+        return existing_clean
+    if aliases and _display_key(existing_clean) in aliases:
+        return incoming_clean
+    if not _has_lowercase_letter(existing_clean) and _has_lowercase_letter(incoming_clean):
+        return incoming_clean
+    return existing_clean
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -141,11 +200,13 @@ class BroadcastStore:
         *  Otherwise leave the existing row untouched and return its id.
         """
 
-        norm_artist = (artist or "").strip().casefold()
-        norm_title = (title or "").strip().casefold()
+        display_artist = _display_value(artist, aliases=_ARTIST_DISPLAY_ALIASES)
+        display_title = _display_value(title)
+        norm_artist = _display_key(display_artist)
+        norm_title = _display_key(display_title)
         existing = self._conn.execute(
             """
-            SELECT id, audfprint_track_id, source
+            SELECT id, audfprint_track_id, source, artist, title
             FROM songs
             WHERE LOWER(TRIM(COALESCE(artist, ''))) = ?
               AND LOWER(TRIM(COALESCE(title,  ''))) = ?
@@ -158,26 +219,43 @@ class BroadcastStore:
             song_id = int(existing[0])
             existing_track_id = existing[1]
             existing_source = existing[2]
+            existing_artist = existing[3]
+            existing_title = existing[4]
+
+            next_track_id = existing_track_id
+            next_source = existing_source
             if existing_track_id is None and audfprint_track_id is not None:
-                # Upgrade the row in place: a Shazam discovery has been
-                # confirmed against a real reference file we can fingerprint.
-                self._conn.execute(
-                    """
-                    UPDATE songs
-                       SET audfprint_track_id = ?,
-                           source = ?
-                     WHERE id = ?
-                    """,
-                    (audfprint_track_id, "audfprint", song_id),
-                )
-                self._conn.commit()
+                next_track_id = audfprint_track_id
+                next_source = "audfprint"
             elif existing_source != source and source == "audfprint" and existing_source == "shazam":
                 # No track id either way (caller didn't supply one and we
                 # don't have one), but a deterministic audfprint match still
                 # outranks the prior Shazam guess for "source".
+                next_source = "audfprint"
+
+            next_artist = _prefer_display_value(
+                existing_artist,
+                display_artist,
+                aliases=_ARTIST_DISPLAY_ALIASES,
+            )
+            next_title = _prefer_display_value(existing_title, display_title)
+
+            if (
+                next_track_id != existing_track_id
+                or next_source != existing_source
+                or next_artist != existing_artist
+                or next_title != existing_title
+            ):
                 self._conn.execute(
-                    "UPDATE songs SET source = ? WHERE id = ?",
-                    ("audfprint", song_id),
+                    """
+                    UPDATE songs
+                       SET audfprint_track_id = ?,
+                           source = ?,
+                           artist = ?,
+                           title = ?
+                     WHERE id = ?
+                    """,
+                    (next_track_id, next_source, next_artist, next_title, song_id),
                 )
                 self._conn.commit()
             return song_id
@@ -186,7 +264,7 @@ class BroadcastStore:
             INSERT INTO songs (audfprint_track_id, artist, title, source)
             VALUES (?, ?, ?, ?)
             """,
-            (audfprint_track_id, artist, title, source),
+            (audfprint_track_id, display_artist, display_title, source),
         )
         self._conn.commit()
         return int(cur.lastrowid or 0)

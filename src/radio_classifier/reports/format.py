@@ -8,6 +8,7 @@ from radio_classifier.reports.queries import (
     BrandRow,
     CommercialRow,
     SongRow,
+    SongTimelineRow,
     SummaryRow,
     TimelineRow,
 )
@@ -73,13 +74,14 @@ def format_brands(rows: list[BrandRow]) -> str:
 
 
 def format_songs(rows: list[SongRow]) -> str:
-    headers = ["song_id", "artist", "title", "spins", "segments", "total"]
+    headers = ["song_id", "artist", "title", "spins", "promos", "segments", "total"]
     body = [
         [
             str(r.song_id) if r.song_id is not None else "?",
             r.artist or "?",
-            r.title or "?",
-            str(r.spin_count),
+            _decorate_promo_title(r.title or "?", r.is_promo_only),
+            _spin_cell(r.full_spin_count, r.promo_spin_count),
+            _promo_cell(r.promo_spin_count, r.promo_duration_seconds),
             str(r.segment_count),
             _format_seconds(r.total_duration_seconds),
         ]
@@ -88,12 +90,30 @@ def format_songs(rows: list[SongRow]) -> str:
     return _render_table(headers, body)
 
 
-def format_artists(rows: list[ArtistRow]) -> str:
-    headers = ["artist", "spins", "titles", "segments", "total"]
+def format_songs_timeline(rows: list[SongTimelineRow]) -> str:
+    headers = ["start_utc", "duration", "song_id", "artist", "title", "source", "confidence"]
     body = [
         [
-            r.artist,
-            str(r.spin_count),
+            r.start_utc,
+            _format_seconds(r.duration_seconds),
+            str(r.song_id) if r.song_id is not None else "?",
+            r.artist or "?",
+            r.title or "?",
+            r.detection_source or "unknown",
+            f"{r.confidence:.3g}" if r.confidence is not None else "-",
+        ]
+        for r in rows
+    ]
+    return _render_table(headers, body)
+
+
+def format_artists(rows: list[ArtistRow]) -> str:
+    headers = ["artist", "spins", "promos", "titles", "segments", "total"]
+    body = [
+        [
+            _decorate_promo_title(r.artist, r.is_promo_only),
+            _spin_cell(r.full_spin_count, r.promo_spin_count),
+            _promo_cell(r.promo_spin_count, r.promo_duration_seconds),
             str(r.distinct_titles),
             str(r.segment_count),
             _format_seconds(r.total_duration_seconds),
@@ -143,6 +163,32 @@ def format_summary(rows: list[SummaryRow]) -> str:
         for r in rows
     ]
     return _render_table(headers, body)
+
+
+def _spin_cell(full_spins: int, promo_spins: int) -> str:
+    """Render the ``spins`` column with a hint when promo clips are included.
+
+    Examples:
+      * ``"3"`` — three normal-length plays, no promos detected.
+      * ``"0 (+10)"`` — every detected spin was a short promo clip.
+      * ``"2 (+1)"`` — two full plays plus one promo-shaped spin.
+    """
+    if promo_spins <= 0:
+        return str(full_spins)
+    return f"{full_spins} (+{promo_spins})"
+
+
+def _promo_cell(promo_count: int, promo_duration: float) -> str:
+    if promo_count <= 0:
+        return "-"
+    return f"{promo_count} / {_format_seconds(promo_duration)}"
+
+
+def _decorate_promo_title(label: str, is_promo_only: bool) -> str:
+    """Annotate the song/artist label when every spin was promo-shaped."""
+    if not is_promo_only:
+        return label
+    return f"{label} [promo]"
 
 
 def _artist_title(artist: str | None, title: str | None) -> str:

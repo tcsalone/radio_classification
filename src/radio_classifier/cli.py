@@ -138,6 +138,15 @@ def _add_funnel_arguments(p: argparse.ArgumentParser) -> None:
         help="audfprint index file (default: data/audfprint/songs.pklz)",
     )
     p.add_argument(
+        "--audfprint-min-count",
+        type=int,
+        default=45,
+        help=(
+            "Minimum audfprint common-hash count to surface a Tier-1 candidate "
+            "(default: 45; low scores still require extra adjacent confirmation)"
+        ),
+    )
+    p.add_argument(
         "--no-tier1",
         action="store_true",
         help="Skip Tier 1 audfprint matching (debug)",
@@ -317,6 +326,12 @@ def _build_parser() -> argparse.ArgumentParser:
     fp_eval = fp_sub.add_parser("eval", help="Recall harness against truth CSV")
     fp_eval.add_argument("--index", type=Path, default=None, help="Index file (default: data/audfprint/songs.pklz)")
     fp_eval.add_argument("--truth", type=Path, required=True, help="CSV: clip,song_id or clip,artist,title")
+    fp_eval.add_argument(
+        "--audfprint-min-count",
+        type=int,
+        default=45,
+        help="Minimum audfprint common-hash count for eval candidates (default: 45)",
+    )
 
     # ---- classify (offline)
     cls = sub.add_parser("classify", help="3-tier funnel over a WAV file")
@@ -365,21 +380,41 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- report
     rep = sub.add_parser("report", help="CLI reports against a v2 SQLite DB")
     rep_sub = rep.add_subparsers(dest="report_command", required=True)
-    for name in ("commercials", "brands", "songs", "artists", "timeline", "summary"):
+    for name in (
+        "commercials",
+        "brands",
+        "songs",
+        "songs-timeline",
+        "artists",
+        "timeline",
+        "summary",
+        "dashboard",
+    ):
         help_text = None
         if name == "artists":
             help_text = (
                 "Per-artist airtime rollup (case-folded dedup, spins, distinct "
                 "titles, total airtime)"
             )
+        elif name == "songs-timeline":
+            help_text = "Chronological SONG-only listening log"
+        elif name == "dashboard":
+            help_text = "Write a static HTML metrics dashboard"
         r = rep_sub.add_parser(name, help=help_text)
         r.add_argument("--db-path", type=Path, default=None)
         r.add_argument("--since", type=str, default="24h")
         r.add_argument("--top", type=int, default=10, help="Limit (default 10)")
         if name == "commercials":
             r.add_argument("--brand", type=str, default=None, help="Filter to a single brand")
-        if name == "timeline":
+        if name in {"timeline", "songs-timeline"}:
             r.add_argument("--limit", type=int, default=500)
+        if name == "dashboard":
+            r.add_argument(
+                "--out",
+                type=Path,
+                default=None,
+                help="Output HTML path (default: data/reports/dashboard.html)",
+            )
 
     # ---- seed
     seed = sub.add_parser("seed", help="Seeding toolchain (optional [seeding] extra)")
@@ -473,6 +508,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the dedupe plan without modifying the DB.",
     )
 
+    # ---- commercials cleanup workflow
+    commercials = sub.add_parser(
+        "commercials",
+        help="Inspect and clean up text-derived commercial identities",
+    )
+    commercials_sub = commercials.add_subparsers(dest="commercials_command", required=True)
+    commercials_dedupe = commercials_sub.add_parser(
+        "dedupe",
+        help="Preview/fold duplicate commercial rows from brand variants or adjacent split windows.",
+    )
+    commercials_dedupe.add_argument("--db-path", type=Path, default=None)
+    commercials_dedupe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the dedupe plan without modifying the DB (default).",
+    )
+    commercials_dedupe.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the dedupe plan. Without this flag the command is read-only.",
+    )
+
     return p
 
 
@@ -547,11 +604,11 @@ def cmd_fp_index(args: argparse.Namespace) -> int:
 
 
 def cmd_fp_eval(args: argparse.Namespace) -> int:
-    from radio_classifier.fingerprint import AudfprintIndex
+    from radio_classifier.fingerprint import AudfprintConfig, AudfprintIndex
     from radio_classifier.seeding.eval import evaluate, load_truth
 
     index_path = args.index or _default_index_path()
-    index = AudfprintIndex(index_path=index_path)
+    index = AudfprintIndex(index_path=index_path, config=AudfprintConfig(min_count=args.audfprint_min_count))
     if not index.exists():
         print(f"radio-classifier fingerprint eval: index missing: {index_path}", file=sys.stderr)
         return 1
@@ -581,10 +638,13 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
 
     tier1 = None
     if not args.no_tier1:
-        from radio_classifier.fingerprint import AudfprintIndex
+        from radio_classifier.fingerprint import AudfprintConfig, AudfprintIndex
 
         index_path = args.audfprint_index or _default_index_path()
-        idx = AudfprintIndex(index_path=index_path)
+        idx = AudfprintIndex(
+            index_path=index_path,
+            config=AudfprintConfig(min_count=args.audfprint_min_count),
+        )
         if not idx.exists():
             print(
                 f"radio-classifier: WARNING audfprint index missing at {index_path}; "
@@ -1166,12 +1226,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         format_brands,
         format_commercials,
         format_songs,
+        format_songs_timeline,
         format_summary,
         format_timeline,
         parse_since,
+        songs_timeline,
         songs_top,
         summary,
         timeline,
+        write_dashboard,
     )
 
     db_path = _resolve_db_path(args.db_path)
@@ -1194,6 +1257,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         elif args.report_command == "songs":
             rows = songs_top(store, since_utc=since_utc, top_n=args.top)
             print(format_songs(rows))
+        elif args.report_command == "songs-timeline":
+            rows = songs_timeline(store, since_utc=since_utc, limit=args.limit)
+            print(format_songs_timeline(rows))
         elif args.report_command == "artists":
             rows = artists_top(store, since_utc=since_utc, top_n=args.top)
             print(format_artists(rows))
@@ -1203,6 +1269,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         elif args.report_command == "summary":
             rows = summary(store, since_utc=since_utc)
             print(format_summary(rows))
+        elif args.report_command == "dashboard":
+            out_path = args.out or (_project_root() / "data" / "reports" / "dashboard.html")
+            written = write_dashboard(
+                store,
+                since_utc=since_utc,
+                out_path=out_path,
+                top_n=args.top,
+            )
+            print(f"radio-classifier: wrote dashboard to {written}")
         else:
             print(f"radio-classifier report: unknown subcommand", file=sys.stderr)
             return 2
@@ -1434,6 +1509,52 @@ def cmd_songs_dedupe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_commercials_dedupe(args: argparse.Namespace) -> int:
+    from radio_classifier.commercials import dedupe_commercials
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(f"radio-classifier commercials dedupe: db not found: {db_path}", file=sys.stderr)
+        return 1
+
+    dry_run = True if args.dry_run else not args.apply
+    with BroadcastStore(db_path) as store:
+        report = dedupe_commercials(store, dry_run=dry_run)
+
+    if not report.groups:
+        print("radio-classifier: no duplicate commercial groups found", file=sys.stderr)
+        return 0
+
+    verb = "would fold" if report.dry_run else "folded"
+    print(
+        f"radio-classifier: {verb} {report.collapsed_pairs} duplicate commercial row(s) "
+        f"across {len(report.groups)} group(s)",
+        file=sys.stderr,
+    )
+    for group in report.groups:
+        survivor = group.survivor
+        print(
+            f"  {survivor.canonical_brand!r} [{group.reason}] → "
+            f"keep commercial_id={survivor.commercial_id} ({survivor.event_count} event(s))",
+            file=sys.stderr,
+        )
+        for loser in group.losers:
+            print(
+                f"    drop commercial_id={loser.commercial_id} "
+                f"({loser.brand!r}, {loser.event_count} event(s))",
+                file=sys.stderr,
+            )
+
+    if not report.dry_run:
+        print(
+            f"\nradio-classifier: re-pointed {report.events_repointed} broadcast_events row(s); "
+            f"re-pointed {report.brand_mentions_repointed} paid brand mention(s); "
+            f"deleted {report.rows_deleted} commercial row(s)",
+            file=sys.stderr,
+        )
+    return 0
+
+
 # -------------------------------------------------------------------- main
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
@@ -1473,6 +1594,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_songs_promote(args)
             if args.songs_command == "dedupe":
                 return cmd_songs_dedupe(args)
+            return 2
+        if args.command == "commercials":
+            if args.commercials_command == "dedupe":
+                return cmd_commercials_dedupe(args)
             return 2
         return 1
     except _CliConfigError as exc:

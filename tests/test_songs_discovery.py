@@ -214,6 +214,38 @@ def test_promote_skips_normalized_duplicate(tmp_path: Path) -> None:
         store.close()
 
 
+def test_promote_skips_tracklist_match_with_apostrophe_and_feature_suffix(tmp_path: Path) -> None:
+    store = BroadcastStore(tmp_path / "tracklist-normalize.db")
+    tracklist = tmp_path / "tracklist.txt"
+    _write_tracklist(
+        tracklist,
+        [
+            "Royel Otis | Who's Your Boyfriend",
+            "Weezer | Go Away",
+            "Dexter And The Moonrocks | Freakin' Out",
+        ],
+    )
+    try:
+        royel = store.upsert_song(artist="Royel Otis", title="who’s your boyfriend", source="shazam")
+        weezer = store.upsert_song(artist="Weezer", title="Go Away (feat. Best Coast)", source="shazam")
+        dexter = store.upsert_song(
+            artist="Dexter and The Moonrocks",
+            title="Freakin’ Out",
+            source="shazam",
+        )
+
+        result = promote_to_tracklist(
+            store,
+            song_ids=[royel, weezer, dexter],
+            tracklist_path=tracklist,
+        )
+        assert result.appended_count == 0
+        assert result.skipped_count == 3
+        assert all(p.reason == "already in tracklist" for p in result.promoted)
+    finally:
+        store.close()
+
+
 def test_promote_refuses_non_shazam_source(tmp_path: Path) -> None:
     store = _seed_shazam_db(tmp_path)
     tracklist = tmp_path / "tracklist.txt"

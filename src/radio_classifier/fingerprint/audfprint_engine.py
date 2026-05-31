@@ -73,17 +73,21 @@ class AudfprintConfig:
     *  5 (upstream default) — far too permissive on live FM.
     * 12 — first tightening; still produced clusters of 10-40s false matches
       with scores in the 20-50 range (e.g. SLTS / Otherside / Clocks ghosts).
-    * 60 — current floor. A 2026-05-28 morning-drive validation run showed a
+    * 60 — conservative floor. A 2026-05-28 morning-drive validation run showed a
       bimodal score distribution with a clean valley at [50, 70): every
       manually-confirmed real match scored >=84, every confirmed false
       positive scored <=49. Setting the floor at 60 drops the noise pile
       without losing any verified real hit.
+    * 45 — current candidate floor. Borderline matches in the 45-59 range are
+      allowed out of audfprint so the funnel can recover weak real hits, but
+      :class:`FunnelOrchestrator` requires additional adjacent same-track
+      confirmation before accepting them.
 
     Tune via :class:`AudfprintIndex` per deployment if recall degrades on a
     different station / index.
     """
 
-    min_count: int = 60
+    min_count: int = 45
     match_win: int = 2
     density: int = 20
     max_matches: int = 1

@@ -101,8 +101,11 @@ class FunnelOrchestrator:
     window_seconds: float = 20.0
     speech_override_threshold: float = 0.10
     suppress_singleton_fingerprint_matches: bool = True
+    fingerprint_strong_score_threshold: float = 60.0
+    low_confidence_fingerprint_required_repeats: int = 3
     shazam_recheck_windows: int = 4
-    _previous_fingerprint_track_id: str | None = field(default=None, init=False, repr=False)
+    _fingerprint_run_track_id: str | None = field(default=None, init=False, repr=False)
+    _fingerprint_run_length: int = field(default=0, init=False, repr=False)
     _unknown_music_window_count: int = field(default=0, init=False, repr=False)
     _cached_shazam: ShazamResult | None = field(default=None, init=False, repr=False)
 
@@ -295,24 +298,44 @@ class FunnelOrchestrator:
         if not self.suppress_singleton_fingerprint_matches:
             return fp
 
-        current_track_id = fp.track_id if fp.status is FingerprintStatus.match else None
-        previous_track_id = self._previous_fingerprint_track_id
-        self._previous_fingerprint_track_id = current_track_id
-
         if fp.status is not FingerprintStatus.match:
+            self._fingerprint_run_track_id = None
+            self._fingerprint_run_length = 0
             return fp
-        if current_track_id is not None and current_track_id == previous_track_id:
+
+        current_track_id = fp.track_id
+        if current_track_id is not None and current_track_id == self._fingerprint_run_track_id:
+            self._fingerprint_run_length += 1
+        else:
+            self._fingerprint_run_track_id = current_track_id
+            self._fingerprint_run_length = 1
+
+        score = float(fp.match_score or 0.0)
+        required_repeats = (
+            2
+            if score >= self.fingerprint_strong_score_threshold
+            else max(2, int(self.low_confidence_fingerprint_required_repeats))
+        )
+        if current_track_id is not None and self._fingerprint_run_length >= required_repeats:
             return fp
 
         count = f" count={int(fp.match_score)}" if fp.match_score is not None else ""
+        if required_repeats > 2 and self._fingerprint_run_length > 1:
+            reason = (
+                "suppressed low-confidence fingerprint match "
+                f"track={fp.track_id!r}{count}; requires {required_repeats} "
+                f"adjacent same-track matches below score {self.fingerprint_strong_score_threshold:g}"
+            )
+        else:
+            reason = (
+                "suppressed singleton fingerprint match "
+                f"track={fp.track_id!r}{count}; requires adjacent same-track match"
+            )
         return FingerprintResult(
             status=FingerprintStatus.no_match,
             window_start_utc=fp.window_start_utc,
             match_score=fp.match_score,
-            message=(
-                "suppressed singleton fingerprint match "
-                f"track={fp.track_id!r}{count}; requires adjacent same-track match"
-            ),
+            message=reason,
         )
 
     def _record_song_from_fingerprint(self, fp: FingerprintResult) -> int | None:

@@ -7,12 +7,22 @@ import sys
 import pytest
 
 from radio_classifier.fingerprint.audfprint_engine import (
+    AudfprintConfig,
     _audfprint_argv,
     _split_track_id,
     parse_audfprint_batch_output,
     parse_audfprint_match_output,
 )
 from radio_classifier.fingerprint.types import FingerprintStatus
+
+
+def test_default_audfprint_candidate_floor_is_below_strong_acceptance_floor() -> None:
+    """The CLI now surfaces 45-59 score candidates for downstream confirmation.
+
+    They are not accepted directly by the funnel; low-confidence candidates
+    need extra adjacent same-track support before Tier 1 wins.
+    """
+    assert AudfprintConfig().min_count == 45
 
 
 def test_parse_no_match_explicit() -> None:

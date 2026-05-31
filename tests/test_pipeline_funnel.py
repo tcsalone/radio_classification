@@ -244,6 +244,68 @@ def test_adjacent_same_track_fingerprint_match_is_confirmed() -> None:
     assert second.segment_input.key.category is BroadcastCategory.SONG
 
 
+def test_low_confidence_fingerprint_match_requires_three_adjacent_hits() -> None:
+    """Borderline audfprint candidates need stronger temporal support.
+
+    The candidate floor can be lower than the strong acceptance score to
+    recover weak real matches, but accepting a 45-59 score after only two
+    windows would re-open the old false-positive cluster. Require three
+    adjacent same-track hits until the current score reaches the strong floor.
+    """
+    track_id = "data/reference/songs/Linkin Park - Numb.mp3"
+    orch = FunnelOrchestrator(
+        tier1=SequenceTier1(
+            [
+                FingerprintResult(
+                    status=FingerprintStatus.match,
+                    window_start_utc="",
+                    artist="Linkin Park",
+                    title="Numb",
+                    track_id=track_id,
+                    match_score=49.0,
+                ),
+                FingerprintResult(
+                    status=FingerprintStatus.match,
+                    window_start_utc="",
+                    artist="Linkin Park",
+                    title="Numb",
+                    track_id=track_id,
+                    match_score=52.0,
+                ),
+                FingerprintResult(
+                    status=FingerprintStatus.match,
+                    window_start_utc="",
+                    artist="Linkin Park",
+                    title="Numb",
+                    track_id=track_id,
+                    match_score=55.0,
+                ),
+            ]
+        ),
+        tier2=FakeTier2(
+            label=AcousticLabel.MUSIC,
+            music_prob=0.88,
+            speech_prob=0.01,
+            other_prob=0.11,
+        ),
+        tier3=_tier3(BroadcastCategory.DJ),
+        resolver=None,
+        store=None,
+    )
+
+    first = orch.process(_make_window("2020-01-01T00:00:00.000Z"))
+    second = orch.process(_make_window("2020-01-01T00:00:10.000Z"))
+    third = orch.process(_make_window("2020-01-01T00:00:20.000Z"))
+
+    assert first.stage is FunnelStage.tier2_unknown_song
+    assert second.stage is FunnelStage.tier2_unknown_song
+    assert second.fingerprint is not None
+    assert "suppressed low-confidence fingerprint match" in (second.fingerprint.message or "")
+    assert third.stage is FunnelStage.tier1_fingerprint
+    assert third.fingerprint is not None
+    assert third.fingerprint.status is FingerprintStatus.match
+
+
 def test_adjacent_different_track_fingerprint_match_is_suppressed() -> None:
     orch = FunnelOrchestrator(
         tier1=SequenceTier1(
