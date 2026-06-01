@@ -68,7 +68,7 @@ def evaluate(
     correct = 0
     for clip, expected in truth.items():
         result = index.match_file(clip)
-        matched_label = result.track_id or _join(result.artist, result.title)
+        matched_label = _join(result.artist, result.title) or result.track_id
         is_correct = False
         if result.status is FingerprintStatus.match and matched_label is not None:
             if case_insensitive:

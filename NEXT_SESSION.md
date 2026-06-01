@@ -144,6 +144,204 @@ Output columns: `start_utc`, `duration`, `artist`, `title`, `confidence`, `detec
 - `--unknown-only` flag to list just the `?` rows for investigation.
 - `--csv` flag to dump as CSV for spreadsheet analysis.
 
+## Findings from the 2026-05-31 16h continuous run (manual validation)
+
+### 8. Audfprint miss-rate problem on tracks already in the catalog
+
+**The question:** Manual listening of "unknown SONG" segments from the 16h run on
+2026-05-31 found that **almost every "unknown" was a song we already had
+reference audio for**. Audfprint just didn't match.
+
+**Concrete misses validated by ear:**
+
+| Segment | UTC | Duration | Track | Catalog status |
+| --- | --- | --- | --- | --- |
+| block 21 @ 14:40 | 17:55:44Z | 100s | Oasis - Wonderwall | in tracklist + ref MP3 on disk |
+| block 5  @ 13:40 | 09:54:54Z |  50s | Bad Omens - Dying To Love | in tracklist + ref on disk (songs row still `source=shazam`, never matched) |
+| block 1  @ 15:20 | 07:56:34Z |  40s | The White Stripes - Fell In Love With a Girl | catalog + ref, matched fine on previous runs |
+| block 2  @ 1:20  | 08:12:34Z |  40s | In Color - Headlights | catalog + ref (just promoted this session) |
+| block 6  @ 6:40  | 10:17:54Z |  40s | Temper City - Self Aware (end fragment) | catalog + ref |
+| block 7  @ 12:20 | 10:53:34Z |  40s | The Cranberries - Zombie (very end) | catalog + ref |
+
+**Why this matters:** the 100s Wonderwall miss is the standout — that's three
+windows long, well above any "fragment too short to fingerprint" excuse.
+
+**Likely root causes (need to differentiate):**
+
+1. **Tail/intro fragment hashing is sparse.** Self Aware end + Zombie end are
+   classic short-tail cases. Less actionable.
+2. **High harmonic density tracks** (Wonderwall acoustic, In Color) have
+   uneven hash distributions across the song and audfprint may pick a region
+   that doesn't share many hashes with the broadcast capture.
+3. **Reference download quality.** The "best" stream we now grab without
+   transcoding could be opus/webm at lower bitrate than the previous mp3
+   192k. Worth confirming for the freshly-promoted In Color / Bad Omens
+   files specifically.
+4. **min_count = 45 floor + low-confidence-needs-3-adjacent rule** might be
+   suppressing real hits below the 60 threshold for these tracks.
+
+**Things to try next session:**
+
+- Run `fingerprint eval` against the validated truth list above to measure
+  current recall, then sweep `min_count` in `[30, 35, 40, 45]` and the
+  `low_confidence_fingerprint_required_repeats` in `[2, 3]` and graph
+  recall/precision.
+- For each of the six tracks, run `audfprint match` directly against the
+  broadcast clip to see the actual score the index reports. If scores are
+  uniformly very low (single digits) the issue is reference-side
+  fingerprint quality. If scores are 40-44 (just below the floor), the
+  threshold is too strict.
+- Inspect the codecs of the freshly-downloaded reference files
+  (`In Color`, `Bad Omens`, the six manual-review promotions, M.I.A.
+  Paper Planes). If any are sub-128k opus, force a transcode for those.
+
+### 9. Tier 2 misclassifications: commercials/PSAs with music beds bypass YAMNet
+
+**The question:** Three of the "unknown SONG" segments from the 16h run were
+actually non-music content that YAMNet labeled as MUSIC, so they flowed into
+the song path and audfprint/Shazam both correctly returned no match — leaving
+them stuck as `category=SONG, song_id=NULL`.
+
+**Concrete examples (16h run, 2026-05-31):**
+
+- block 12 @ 18:20 — "Conversations" PSA (40s)
+- block 13 @ 18:30 — Twisted Tea hard ice tea commercial (40s)
+- block 14 @ 19:40 — Gatorade Lower Sugar commercial (40s)
+
+**Why this matters:** these are now contaminating the unknown-song
+investigation queue (people manually validate them thinking they're missing
+songs). They're also subtracting from the COMMERCIAL airtime stat.
+
+**Root cause hypothesis:** the Tier 2 MUSIC threshold treats any window with
+a clear melodic backing track as MUSIC, even when the dominant signal is a
+speech voice-over. Twisted Tea and Gatorade ads both have jingle/music beds
+under the VO.
+
+**Things to try next session:**
+
+- **Stricter MUSIC gate**: require the MUSIC score to exceed SPEECH by some
+  margin (e.g. `music_score - speech_score >= 0.15`), not just be the top
+  class. Easy to A/B because we already log the per-window YAMNet scores.
+- **Speech-energy lookahead**: when MUSIC wins but SPEECH is close, check if
+  the next/previous 1-2 windows were SPEECH; if so, retain SPEECH.
+- **Rescue path post-classify**: when a SONG segment matches neither
+  audfprint nor Shazam over its entire duration, AND a Tier-3 transcript
+  exists for adjacent windows mentioning a brand name, reclassify the
+  segment as COMMERCIAL or DJ.
+
+### 10. `Bad Omens - Dying To Love` and `In Color - Headlights` audfprint-after-promotion miss
+
+**Specific instance of #8 worth its own bullet** because it has a clear
+reproduction: both tracks were promoted via `songs promote` in earlier
+sessions, the reference audio was downloaded and indexed, but the songs row
+in the DB still shows `source=shazam` and `audfprint_track_id=NULL` after
+multiple runs that should have triggered an audfprint match.
+
+**Diagnostic steps:**
+
+1. `audfprint match -d data/audfprint/songs.pklz <broadcast_clip.wav>` for a
+   known timestamp where the track played. Compare score vs `min_count=45`.
+2. Confirm the ref files are inside the rebuilt index:
+   `audfprint list -d data/audfprint/songs.pklz | grep -i 'In Color'`.
+3. If matches are below `min_count`, try re-downloading those refs with the
+   explicit `--audio-format mp3` legacy path to rule out opus quality
+   degradation. (We changed the default to "best" / no-transcode this
+   session, so freshly promoted tracks may be webm/opus instead of mp3.)
+
+### 11. Add M.I.A. - Paper Planes to local fingerprint catalog
+
+**Status:** DONE this session. Track id 104 was Shazam-only with no
+reference audio; promoted to tracklist, downloaded, and audfprint index
+rebuilt with 151 files. Should resolve as Tier-1 on future runs.
+
+### 12. Reference-codec audit + audfprint wrapper best-by-score fix (2026-05-31)
+
+**Status:** DONE this session. Two large issues were uncovered during the
+fingerprint eval audit and both have been fixed.
+
+**Issue A — webm/opus refs poisoned the index.**
+The eight tracks promoted under the new no-transcode `seed download`
+default landed as `.webm` (opus). Their fingerprints came out
+high-density and noisy (e.g. `Djo - Basic Being Basic.webm` had 500+
+common hashes vs. ~50-300 for mp3 refs), which caused them to win
+audfprint's `rank 0` slot across *unrelated* query clips with small
+scores. Combined with our `--max-matches 1` setting that meant the real
+higher-score match (sitting at `rank 1+`) was never reported.
+
+Fix:
+
+- Re-downloaded all eight `.webm` refs as MP3 192 kbps (`Coldplay - Fix
+  You`, `Djo - Basic Being Basic`, `Fun. - We Are Young (feat. Janelle
+  Monáe)`, `Green Day - When I Come Around`, `Linkin Park - Somewhere I
+  Belong`, `M.I.A. - Paper Planes`, `Sum 41 - In Too Deep`, `The
+  Cranberries - Zombie`). Old files quarantined under
+  `data/reference/_quarantine_webm_20260531/`.
+- Reverted `DownloadConfig` / CLI default from `--audio-format best`
+  back to `--audio-format mp3 --audio-quality 192`. The no-transcode
+  path remains available behind an explicit flag.
+- Rebuilt `data/audfprint/songs.pklz` (151 mp3 files).
+
+**Issue B — audfprint `rank 0` is not score-ordered.**
+The wrapper used `--max-matches 1` and the parser returned the first
+`Matched` line. Both assumptions are wrong: audfprint's `rank` field
+groups hits by reference, and a noisy reference can sit at `rank 0`
+with a low score even when the real best-by-score match is at `rank
+1+`. This silently turned real recovery candidates into NOMATCHes.
+
+Fix:
+
+- `AudfprintConfig.max_matches` default raised from 1 to 5.
+- `parse_audfprint_match_output` and `parse_audfprint_batch_output` now
+  scan all `Matched` lines for the query and return the highest-score
+  one. Regression tests `test_parse_picks_best_match_by_score` and
+  `test_parse_batch_picks_best_match_per_query` cover both.
+
+**Validated unknowns eval — before vs after (`data/eval/fingerprint_20260531_validated_unknowns/`):**
+
+| min_count | recall (before repair) | recall (after repair) |
+|----------:|-----------------------:|----------------------:|
+| 45        | 0 / 7                  | 0 / 7                 |
+| 30        | 0 / 7                  | 1 / 7 (Bad Omens 60)  |
+| 20        | 0 / 7                  | 2 / 7 (+ White Stripes 22) |
+| 10        | 0 / 7                  | 2 / 7                 |
+| 5         | 0 / 7                  | 4 / 7 (+ In Color 10, + Cranberries 14) |
+
+Three clips remain stubbornly unrecoverable even at the floor:
+
+- **Wonderwall (block 21):** zero hash overlap with the Oasis ref at
+  any threshold. The reference self-matches perfectly (690/806), so the
+  ref is correct. Either the broadcast played a different mix (live /
+  remaster variant) or the FM degradation that day stripped the
+  high-frequency landmarks audfprint depends on. **Action:** try adding
+  a second Wonderwall reference from a different YouTube source (e.g.
+  the original 1995 master rather than the 2024 stereo remaster).
+- **M.I.A. Paper Planes (block 14):** best real score is 4. Genuine
+  weak signal — clip likely contains heavy DJ talk or song bookends.
+  Re-clipping a cleaner 30 s window from the body of the song may
+  recover it.
+- **Temper City Self Aware (block 6):** real score 16, but
+  `Linkin Park - Somewhere I Belong.mp3` legitimately scores **67** on
+  the same clip. The two songs share an identifiable mid-tempo
+  alt-metal riff; this is a real fingerprint collision. The funnel's
+  `low_confidence_fingerprint_required_repeats=3` defense should
+  suppress it as long as adjacent windows disagree, but worth keeping
+  on a watch list.
+
+**Open follow-up (deferred):**
+
+- Consider lowering default `AudfprintConfig.min_count` from 45 to ~20.
+  Based on this eval that doubles recall (0 → 2 /7 at the strict floor,
+  4 /7 at 5). The Temper City / Linkin Park collision happens at 67,
+  well above any candidate threshold, so the change wouldn't surface
+  that as a new false positive. Defer until we run the morning-drive
+  bimodal score check from the original `min_count` history to confirm
+  the false-positive floor still sits at ≤ 49.
+- Wonderwall second-reference experiment (above).
+- Build a CLI `fingerprint explain <clip> <expected-track>` diagnostic
+  that prints the expected reference's score / rank even when another
+  reference wins. (We hand-rolled this with `audfprint match
+  --max-matches 20` this session; deserves to be a first-class tool.)
+
 ## Other items spotted during today's 12h run (lower priority)
 
 - ~~**Julia Wolf "In My Room (Acoustic)" promo-vs-song detection:** 10 "spins" in 7m10s = ~43 sec per spin. That's a station promo, not a real play. Spin definition needs a heuristic to disambiguate (e.g., "if average spin duration < 50% of full track length, suppress as promo").~~ **DONE.** Spin tally now reports `full_spin_count` and `promo_spin_count` side by side (threshold `PROMO_MAX_SPIN_SECONDS = 90s`). `report songs` / `report artists` show `spins   promos` columns, the dashboard renders a `+N promo` pill, and the songs/artists sort order tiebreaks by non-promo airtime so teaser-heavy entries drop down the leaderboard. Julia Wolf went from a top-2 entry to #4 in the morning-DB songs report and out of the top-8 artists report.

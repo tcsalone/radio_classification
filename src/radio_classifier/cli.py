@@ -8,6 +8,7 @@ Subcommands:
 * ``fingerprint index`` — build / extend the audfprint song index.
 * ``fingerprint eval``  — run the recall harness against a truth CSV.
 * ``ingest``         — live RTL-SDR capture through the 3-tier funnel.
+* ``capture chunks`` — continuous RTL-SDR capture into fixed WAV chunks.
 * ``classify``       — offline 3-tier funnel on a WAV file.
 * ``report``         — CLI-only reports (commercials / brands / songs / artists / timeline / summary).
 * ``seed scrape``    — print a tracklist parsed from a station page.
@@ -25,6 +26,7 @@ import json
 import os
 import sys
 import time
+import wave
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -103,6 +105,24 @@ def _resolve_capture_wav_path(user_path: Path, clock_start_ns: int) -> Path:
         )
         return _project_root() / "data" / "captures" / f"{ts}.wav"
     return user_path
+
+
+def _iso_from_time_ns(value: int) -> str:
+    return (
+        datetime.fromtimestamp(value / 1e9, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _parse_utc_time_ns(value: str) -> int:
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise _CliConfigError(f"invalid UTC timestamp: {value!r}") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
 
 
 # --------------------------------------------------------------------- parser
@@ -337,6 +357,16 @@ def _build_parser() -> argparse.ArgumentParser:
     cls = sub.add_parser("classify", help="3-tier funnel over a WAV file")
     cls.add_argument("-i", "--input", type=Path, required=True, help="Mono 16-bit WAV path")
     cls.add_argument("--sample-rate-override", type=int, default=None)
+    cls.add_argument(
+        "--capture-start-utc",
+        type=str,
+        default=None,
+        help=(
+            "UTC start timestamp for the input WAV. Use this for delayed "
+            "classification of continuously captured chunks so DB events use "
+            "broadcast time instead of classification time."
+        ),
+    )
     _add_window_arguments(cls)
     _add_funnel_arguments(cls)
     _add_persist_arguments(cls)
@@ -376,6 +406,21 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_persist_arguments(ing)
     _add_json_lines(ing)
     ing.add_argument("-v", "--verbose", action="store_true")
+
+    # ---- capture (record-only helpers)
+    cap = sub.add_parser("capture", help="Record RTL-SDR audio without classification")
+    cap_sub = cap.add_subparsers(dest="capture_command", required=True)
+    cap_chunks = cap_sub.add_parser(
+        "chunks",
+        help="Continuously capture one RTL-SDR stream into fixed-size WAV chunks",
+    )
+    cap_chunks.add_argument("--frequency", type=float, default=105.3e6, help="Center freq Hz")
+    cap_chunks.add_argument("--device-index", type=int, default=0)
+    cap_chunks.add_argument("--sample-rate", type=int, default=48_000)
+    cap_chunks.add_argument("--chunk-seconds", type=float, default=1800.0)
+    cap_chunks.add_argument("--duration-limit", type=float, default=None)
+    cap_chunks.add_argument("--out-dir", type=Path, required=True)
+    cap_chunks.add_argument("--run-id", type=str, default=None)
 
     # ---- report
     rep = sub.add_parser("report", help="CLI reports against a v2 SQLite DB")
@@ -428,8 +473,30 @@ def _build_parser() -> argparse.ArgumentParser:
     seed_dl = seed_sub.add_parser("download", help="Download reference audio via yt-dlp")
     seed_dl.add_argument("--tracklist", type=Path, required=True, help="File with 'artist | title' per line")
     seed_dl.add_argument("--out", type=Path, default=None, help="Output dir (default: data/reference/songs/)")
-    seed_dl.add_argument("--audio-format", type=str, default="mp3")
-    seed_dl.add_argument("--audio-quality", type=str, default="192")
+    seed_dl.add_argument(
+        "--audio-format",
+        type=str,
+        default="mp3",
+        help=(
+            "Audio format passed to yt-dlp. Default 'mp3' transcodes to a "
+            "uniform codec/bitrate, which audfprint indexes more reliably "
+            "than a mixed corpus of m4a/opus/webm originals. Pass 'best' "
+            "to skip the transcode for speed (verify fingerprint recall "
+            "before relying on it)."
+        ),
+    )
+    seed_dl.add_argument(
+        "--audio-quality",
+        type=str,
+        default="192",
+        help="yt-dlp --audio-quality (bitrate in kbps for mp3/m4a/opus).",
+    )
+    seed_dl.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="Parallel yt-dlp downloads (default: 4). Set to 1 for serial mode.",
+    )
 
     # ---- songs (Shazam discovery workflow)
     songs = sub.add_parser(
@@ -1083,7 +1150,11 @@ def cmd_classify(args: argparse.Namespace) -> int:
         return 1
 
     effective_rate = args.sample_rate_override or rate
-    clock_start_ns = time.time_ns()
+    clock_start_ns = (
+        _parse_utc_time_ns(args.capture_start_utc)
+        if args.capture_start_utc
+        else time.time_ns()
+    )
     windows = list(
         iter_overlapping_windows(
             pcm,
@@ -1216,6 +1287,165 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _chunk_base_name(run_id: str, index: int) -> str:
+    return f"{run_id}_block{index:04d}"
+
+
+def _write_chunk_sidecar(
+    *,
+    sidecar_path: Path,
+    wav_path: Path,
+    run_id: str,
+    block_index: int,
+    sample_rate_hz: int,
+    start_ns: int,
+    samples_written: int,
+    complete: bool,
+) -> None:
+    duration_seconds = samples_written / sample_rate_hz if sample_rate_hz else 0.0
+    end_ns = start_ns + int(duration_seconds * 1_000_000_000)
+    payload = {
+        "run_id": run_id,
+        "block_index": block_index,
+        "wav_path": str(wav_path),
+        "capture_start_utc": _iso_from_time_ns(start_ns),
+        "capture_end_utc": _iso_from_time_ns(end_ns),
+        "sample_rate_hz": sample_rate_hz,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "samples": samples_written,
+        "duration_seconds": duration_seconds,
+        "complete": complete,
+    }
+    sidecar_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cmd_capture_chunks(args: argparse.Namespace) -> int:
+    """Capture one uninterrupted RTL-SDR stream into fixed-size WAV chunks.
+
+    This intentionally does **no** classification. It keeps RF capture cheap
+    and continuous while a separate bounded worker classifies completed chunks
+    as GPU/LLM resources allow.
+    """
+
+    if args.chunk_seconds <= 0:
+        print("radio-classifier capture chunks: --chunk-seconds must be > 0", file=sys.stderr)
+        return 1
+    if args.duration_limit is not None and args.duration_limit <= 0:
+        print("radio-classifier capture chunks: --duration-limit must be > 0", file=sys.stderr)
+        return 1
+
+    out_dir: Path = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_id = args.run_id or datetime.now(tz=timezone.utc).strftime("capture_%Y%m%dT%H%M%SZ")
+    sample_rate = int(args.sample_rate)
+    bytes_per_sample = 2
+    target_samples = max(1, int(round(float(args.chunk_seconds) * sample_rate)))
+    target_bytes = target_samples * bytes_per_sample
+
+    stream = RtlFmStream(
+        frequency_hz=args.frequency,
+        device_index=args.device_index,
+        sample_rate_hz=sample_rate,
+    )
+    stream.start()
+    capture_start_ns = time.time_ns()
+    block_index = 1
+    current_bytes = 0
+    current_samples = 0
+    block_start_ns = capture_start_ns
+    wav_path: Path | None = None
+    sidecar_path: Path | None = None
+    wav_file: wave.Wave_write | None = None
+
+    def _open_next_chunk() -> None:
+        nonlocal wav_path, sidecar_path, wav_file, current_bytes, current_samples, block_start_ns
+        base = _chunk_base_name(run_id, block_index)
+        wav_path = out_dir / f"{base}.wav"
+        sidecar_path = out_dir / f"{base}.json"
+        block_start_ns = capture_start_ns + int((block_index - 1) * target_samples / sample_rate * 1_000_000_000)
+        wav_file = wave.open(str(wav_path), "wb")
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(bytes_per_sample)
+        wav_file.setframerate(sample_rate)
+        current_bytes = 0
+        current_samples = 0
+
+    def _close_current_chunk(*, complete: bool) -> None:
+        nonlocal wav_file
+        if wav_file is None or wav_path is None or sidecar_path is None:
+            return
+        wav_file.close()
+        wav_file = None
+        _write_chunk_sidecar(
+            sidecar_path=sidecar_path,
+            wav_path=wav_path,
+            run_id=run_id,
+            block_index=block_index,
+            sample_rate_hz=sample_rate,
+            start_ns=block_start_ns,
+            samples_written=current_samples,
+            complete=complete,
+        )
+        status = "complete" if complete else "partial"
+        print(
+            f"radio-classifier capture chunks: wrote {status} block {block_index} "
+            f"wav={wav_path} sidecar={sidecar_path}",
+            file=sys.stderr,
+        )
+
+    _open_next_chunk()
+    carry = b""
+    try:
+        for raw in stream.iter_stdout_bytes(max_wall_seconds=args.duration_limit):
+            data = carry + raw
+            if len(data) % bytes_per_sample:
+                carry = data[-1:]
+                data = data[:-1]
+            else:
+                carry = b""
+            offset = 0
+            while offset < len(data):
+                assert wav_file is not None
+                available = target_bytes - current_bytes
+                piece = data[offset : offset + available]
+                wav_file.writeframesraw(piece)
+                wrote = len(piece)
+                current_bytes += wrote
+                current_samples += wrote // bytes_per_sample
+                offset += wrote
+                if current_bytes >= target_bytes:
+                    _close_current_chunk(complete=True)
+                    block_index += 1
+                    _open_next_chunk()
+    except RtlFmExitedError as e:
+        print(f"radio-classifier capture chunks: rtl_fm failed: {e}", file=sys.stderr)
+        if current_samples > 0:
+            _close_current_chunk(complete=False)
+        return 1
+    except OSError as e:
+        print(f"radio-classifier capture chunks: I/O error: {e}", file=sys.stderr)
+        if current_samples > 0:
+            _close_current_chunk(complete=False)
+        return 1
+    finally:
+        if wav_file is not None:
+            if current_samples > 0:
+                _close_current_chunk(complete=False)
+            else:
+                wav_file.close()
+                wav_file = None
+
+    # If the capture ended exactly on a chunk boundary, ``_open_next_chunk``
+    # has created an empty placeholder for the next block. Remove it rather
+    # than advertising a zero-length partial chunk.
+    if current_samples == 0 and wav_path is not None and wav_path.exists():
+        wav_path.unlink()
+    if current_samples == 0 and sidecar_path is not None and sidecar_path.exists():
+        sidecar_path.unlink()
+    return 0
+
+
 # ------------------------------------------------------------------ report
 def cmd_report(args: argparse.Namespace) -> int:
     from radio_classifier.reports import (
@@ -1345,6 +1575,7 @@ def cmd_seed_download(args: argparse.Namespace) -> int:
         output_dir=out,
         audio_format=args.audio_format,
         audio_quality=args.audio_quality,
+        concurrency=args.concurrency,
     )
     results = download_tracks(tracks, cfg)
     total = len(results)
@@ -1579,6 +1810,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_classify(args)
         if args.command == "ingest":
             return cmd_ingest(args)
+        if args.command == "capture":
+            if args.capture_command == "chunks":
+                return cmd_capture_chunks(args)
+            return 2
         if args.command == "report":
             return cmd_report(args)
         if args.command == "seed":

@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 
@@ -27,6 +29,7 @@ def test_help_lists_subcommands() -> None:
         "prereq-check",
         "db",
         "fingerprint",
+        "capture",
         "classify",
         "ingest",
         "report",
@@ -49,6 +52,13 @@ def test_classify_help_documents_audfprint_min_count() -> None:
     assert proc.returncode == 0, proc.stderr
     assert "--audfprint-min-count" in proc.stdout
     assert "default: 45" in proc.stdout
+
+
+def test_capture_chunks_help_lists_chunk_options() -> None:
+    proc = _run("capture", "chunks", "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "--chunk-seconds" in proc.stdout
+    assert "--out-dir" in proc.stdout
 
 
 def test_fingerprint_index_rebuilds_existing_index_by_default(
@@ -274,6 +284,99 @@ def test_report_songs_timeline_runs_against_v2_db(tmp_path: Path) -> None:
     assert "Nirvana" in proc.stdout
     assert "Lithium" in proc.stdout
     assert "shazam" in proc.stdout
+
+
+def test_classify_uses_capture_start_utc_for_delayed_chunks(tmp_path: Path) -> None:
+    from radio_classifier.ingest.wav import write_mono_s16le_wav
+
+    wav_path = tmp_path / "chunk.wav"
+    # Two 1-second windows at 4 Hz. Disable all tiers so no models load.
+    write_mono_s16le_wav(wav_path, np.zeros(8, dtype=np.int16), 4)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "radio_classifier",
+            "classify",
+            "-i",
+            str(wav_path),
+            "--sample-rate-override",
+            "4",
+            "--window-seconds",
+            "1",
+            "--overlap-fraction",
+            "0",
+            "--capture-start-utc",
+            "2020-01-01T00:00:00.000Z",
+            "--no-tier1",
+            "--no-tier2",
+            "--no-tier3",
+            "--json-lines",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert '"window_start_utc":"2020-01-01T00:00:00.000Z"' in proc.stdout
+    assert '"window_start_utc":"2020-01-01T00:00:01.000Z"' in proc.stdout
+
+
+def test_capture_chunks_writes_contiguous_wavs_and_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from radio_classifier.cli import main as cli_main
+
+    class FakeRtlFmStream:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.kwargs = kwargs
+
+        def start(self) -> None:
+            return None
+
+        def iter_stdout_bytes(self, max_wall_seconds=None):  # type: ignore[no-untyped-def]
+            # sample_rate=4, chunk_seconds=1 => 4 samples/chunk => 8 bytes.
+            # Emit exactly two complete chunks.
+            yield (b"\x01\x00" * 8)
+
+    monkeypatch.setattr("radio_classifier.cli.RtlFmStream", FakeRtlFmStream)
+
+    out_dir = tmp_path / "chunks"
+    rc = cli_main(
+        [
+            "capture",
+            "chunks",
+            "--out-dir",
+            str(out_dir),
+            "--run-id",
+            "test_run",
+            "--sample-rate",
+            "4",
+            "--chunk-seconds",
+            "1",
+            "--duration-limit",
+            "2",
+        ]
+    )
+    assert rc == 0
+
+    wavs = sorted(out_dir.glob("*.wav"))
+    sidecars = sorted(out_dir.glob("*.json"))
+    assert [p.name for p in wavs] == ["test_run_block0001.wav", "test_run_block0002.wav"]
+    assert [p.name for p in sidecars] == ["test_run_block0001.json", "test_run_block0002.json"]
+
+    first = sidecars[0].read_text(encoding="utf-8")
+    second = sidecars[1].read_text(encoding="utf-8")
+    assert '"complete": true' in first
+    assert '"complete": true' in second
+    assert '"duration_seconds": 1.0' in first
+
+    with wave.open(str(wavs[0]), "rb") as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == 4
+        assert wf.getnframes() == 4
 
 
 def test_report_dashboard_writes_html(tmp_path: Path) -> None:

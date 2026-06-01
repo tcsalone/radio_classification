@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+from unittest import mock
 
 import pytest
 
 from radio_classifier.fingerprint.audfprint_engine import (
     AudfprintConfig,
+    AudfprintIndex,
     _audfprint_argv,
+    _default_index_ncores,
     _split_track_id,
     parse_audfprint_batch_output,
     parse_audfprint_match_output,
@@ -23,6 +27,59 @@ def test_default_audfprint_candidate_floor_is_below_strong_acceptance_floor() ->
     need extra adjacent same-track support before Tier 1 wins.
     """
     assert AudfprintConfig().min_count == 45
+
+
+def test_default_index_ncores_honours_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RADIO_CLASSIFIER_AUDFPRINT_INDEX_NCORES", "3")
+    assert _default_index_ncores() == 3
+
+
+def test_default_index_ncores_ignores_bogus_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RADIO_CLASSIFIER_AUDFPRINT_INDEX_NCORES", "not-a-number")
+    value = _default_index_ncores()
+    assert 1 <= value <= 6
+
+
+def test_build_or_extend_passes_ncores_when_configured(tmp_path: Path) -> None:
+    """Parallel hashing via ``--ncores`` cuts rebuild wall time substantially.
+    The wrapper must forward the configured worker count to audfprint.
+    """
+    idx_path = tmp_path / "songs.pklz"
+    config = AudfprintConfig(index_ncores=4)
+    index = AudfprintIndex(index_path=idx_path, config=config)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"\x00")
+
+    with mock.patch(
+        "radio_classifier.fingerprint.audfprint_engine.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+    ) as run:
+        index.build_or_extend([audio])
+
+    cmd = run.call_args.args[0]
+    assert "new" in cmd
+    assert "--ncores" in cmd
+    ncores_index = cmd.index("--ncores")
+    assert cmd[ncores_index + 1] == "4"
+
+
+def test_build_or_extend_omits_ncores_when_single_threaded(tmp_path: Path) -> None:
+    """Single-threaded mode must not pass ``--ncores`` so we stay compatible
+    with audfprint builds that predate the flag."""
+    idx_path = tmp_path / "songs.pklz"
+    config = AudfprintConfig(index_ncores=1)
+    index = AudfprintIndex(index_path=idx_path, config=config)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"\x00")
+
+    with mock.patch(
+        "radio_classifier.fingerprint.audfprint_engine.subprocess.run",
+        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+    ) as run:
+        index.build_or_extend([audio])
+
+    cmd = run.call_args.args[0]
+    assert "--ncores" not in cmd
 
 
 def test_parse_no_match_explicit() -> None:
@@ -93,15 +150,53 @@ def test_parse_strips_negative_offset_suffix_from_track_id() -> None:
     assert r.match_score == 17.0
 
 
-def test_parse_picks_first_match() -> None:
+def test_parse_picks_best_match_by_score() -> None:
+    """We must pick the highest-score line, not the first.
+
+    Regression for an index-poisoning bug where a noisy reference (a poor
+    quality opus/webm rip) won audfprint's ``rank 0`` slot with a small
+    score and crowded out the real, much higher-score match listed below
+    it as ``rank 1+``. With ``--max-matches 1`` this caused real matches
+    to be reported as no-match.
+    """
     stdout = (
-        "Matched q.wav as A - B.mp3 with 10 of 30 common hashes\n"
-        "Matched q.wav as C - D.mp3 with 4 of 30 common hashes\n"
+        "Matched q.wav as Noisy - Reference.webm at 12.0 s "
+        "with 15 of 500 common hashes at rank 0\n"
+        "Matched q.wav as Real - Match.mp3 at 216.0 s "
+        "with 60 of 246 common hashes at rank 1\n"
+        "Matched q.wav as Noisy - Reference.webm at 18.0 s "
+        "with 10 of 500 common hashes at rank 0\n"
     )
     r = parse_audfprint_match_output(stdout, "ts")
     assert r.status is FingerprintStatus.match
-    assert r.artist == "A"
-    assert r.title == "B"
+    assert r.artist == "Real"
+    assert r.title == "Match"
+    assert r.match_score == 60.0
+
+
+def test_parse_batch_picks_best_match_per_query(tmp_path) -> None:
+    """Same best-by-score rule must apply per-query in batch mode."""
+    q1 = tmp_path / "window_000001.wav"
+    q2 = tmp_path / "window_000002.wav"
+    stdout = "\n".join(
+        [
+            f"Matched {q1} as Spurious - Rip.webm at 1.0 s with 5 of 300 common hashes at rank 0",
+            f"Matched {q1} as Correct - Track.mp3 at 60.0 s with 50 of 200 common hashes at rank 1",
+            f"NOMATCH {q2}",
+        ]
+    )
+    results = parse_audfprint_batch_output(stdout, [q1, q2], ["ts1", "ts2"])
+    assert results[0].status is FingerprintStatus.match
+    assert results[0].artist == "Correct"
+    assert results[0].title == "Track"
+    assert results[0].match_score == 50.0
+    assert results[1].status is FingerprintStatus.no_match
+
+
+def test_default_max_matches_is_above_one() -> None:
+    """We need top-N candidates from audfprint so the parser can pick the
+    best-scoring one (audfprint's ``rank 0`` is not score-ordered)."""
+    assert AudfprintConfig().max_matches >= 5
 
 
 def test_parse_batch_output_maps_matches_to_queries(tmp_path) -> None:

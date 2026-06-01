@@ -101,6 +101,7 @@ class BroadcastStore:
         self._schema_path = schema_path or _default_schema_path()
         _ensure_database(self._db_path, self._schema_path)
         self._conn = sqlite3.connect(self._db_path)
+        self._conn.create_function("display_key", 1, _display_key, deterministic=True)
         self._conn.execute("PRAGMA foreign_keys = ON")
         if use_wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -190,7 +191,7 @@ class BroadcastStore:
 
         New behaviour:
 
-        *  Look up by ``LOWER(TRIM(artist))`` / ``LOWER(TRIM(title))`` —
+        *  Look up by the same Unicode-aware display key used in Python —
            source-agnostic and case-insensitive — so a Shazam row found later
            by audfprint resolves to the same row.
         *  If the existing row is missing ``audfprint_track_id`` and the new
@@ -208,8 +209,8 @@ class BroadcastStore:
             """
             SELECT id, audfprint_track_id, source, artist, title
             FROM songs
-            WHERE LOWER(TRIM(COALESCE(artist, ''))) = ?
-              AND LOWER(TRIM(COALESCE(title,  ''))) = ?
+            WHERE display_key(artist) = ?
+              AND display_key(title) = ?
             ORDER BY id ASC
             LIMIT 1
             """,

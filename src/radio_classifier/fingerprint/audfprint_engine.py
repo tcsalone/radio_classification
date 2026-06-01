@@ -30,6 +30,7 @@ from radio_classifier.speech.wav_temp import temp_wav_for_window
 
 
 _AUDFPRINT_BIN_ENV = "RADIO_CLASSIFIER_AUDFPRINT_BIN"
+_AUDFPRINT_INDEX_NCORES_ENV = "RADIO_CLASSIFIER_AUDFPRINT_INDEX_NCORES"
 _MATCH_LINE_RE = re.compile(
     r"^Matched\s+(?P<query>[^\s]+).*?as\s+(?P<track>.+?)"
     r"(?:\s+at\s+-?\d+(?:\.\d+)?\s*s)?"
@@ -62,6 +63,33 @@ def _audfprint_argv() -> list[str]:
     return [sys.executable, "-m", "audfprint"]
 
 
+def _default_index_ncores() -> int:
+    """Pick a sensible worker count for ``audfprint new --ncores``.
+
+    Hashing reference files is embarrassingly parallel and CPU-bound. Upstream
+    defaults to 1, which leaves a multi-core box mostly idle and turns a
+    ~150-file rebuild into a 15+ minute wait. We default to a small fraction
+    of the cores so a concurrent ``classify`` (which already uses CPU for
+    Whisper/YAMNet/audfprint match) is not starved, capped at 6 because
+    audfprint's marginal speedup flattens out beyond that.
+
+    Operators can override with ``RADIO_CLASSIFIER_AUDFPRINT_INDEX_NCORES``.
+    """
+
+    import os
+
+    override = os.environ.get(_AUDFPRINT_INDEX_NCORES_ENV)
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    cpu = os.cpu_count() or 1
+    return max(1, min(6, cpu))
+
+
 @dataclass
 class AudfprintConfig:
     """Match-time tunables. Defaults tuned for FM (validated by Phase J eval).
@@ -90,8 +118,13 @@ class AudfprintConfig:
     min_count: int = 45
     match_win: int = 2
     density: int = 20
-    max_matches: int = 1
+    # NOTE: audfprint's ``rank 0`` is not always the highest-scoring match. A
+    # noisy reference (e.g. a poor-quality opus rip) can win ``rank 0`` with a
+    # low score and crowd out the real higher-score match at ``rank 1``+. We
+    # request the top 5 candidates and pick the best score on our side.
+    max_matches: int = 5
     batch_size: int = 200
+    index_ncores: int = field(default_factory=_default_index_ncores)
 
 
 @dataclass
@@ -122,6 +155,9 @@ class AudfprintIndex:
             "--density",
             str(self.config.density),
         ]
+        ncores = max(1, int(self.config.index_ncores))
+        if ncores > 1:
+            cmd += ["--ncores", str(ncores)]
         cmd += [str(p) for p in audio_files]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
@@ -255,6 +291,12 @@ def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> Fingerpr
       ``Matched query.wav as Foo Bar - Title.mp3 with 13 of ...``
       ``NOMATCH query.wav``
 
+    When multiple ``Matched`` lines are present (because we ask audfprint
+    for the top-N candidates) we choose the line with the highest hash
+    count, not the first. Audfprint's ``rank`` field can put a noisy
+    reference with a low score at ``rank 0`` and the real high-score match
+    at ``rank 1+`` — picking the best by score side-steps that.
+
     Anything else falls through to ``no_match``.
     """
     if not stdout:
@@ -262,6 +304,9 @@ def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> Fingerpr
             status=FingerprintStatus.no_match,
             window_start_utc=window_start_utc,
         )
+
+    best_track: str | None = None
+    best_count: int = -1
 
     for raw in stdout.splitlines():
         line = raw.strip()
@@ -277,19 +322,24 @@ def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> Fingerpr
             continue
         track = m.group("track").strip()
         count = int(m.group("count"))
-        artist, title = _split_track_id(track)
+        if count > best_count:
+            best_count = count
+            best_track = track
+
+    if best_track is None:
         return FingerprintResult(
-            status=FingerprintStatus.match,
+            status=FingerprintStatus.no_match,
             window_start_utc=window_start_utc,
-            track_id=track,
-            artist=artist,
-            title=title,
-            match_score=float(count),
         )
 
+    artist, title = _split_track_id(best_track)
     return FingerprintResult(
-        status=FingerprintStatus.no_match,
+        status=FingerprintStatus.match,
         window_start_utc=window_start_utc,
+        track_id=best_track,
+        artist=artist,
+        title=title,
+        match_score=float(best_count),
     )
 
 
@@ -298,7 +348,12 @@ def parse_audfprint_batch_output(
     query_paths: list[Path],
     window_start_utc: list[str],
 ) -> list[FingerprintResult]:
-    """Parse one ``audfprint match`` output containing many query files."""
+    """Parse one ``audfprint match`` output containing many query files.
+
+    When audfprint is invoked with ``--max-matches > 1`` it emits multiple
+    ``Matched`` lines per query. For each query we keep the line with the
+    highest hash count, mirroring :func:`parse_audfprint_match_output`.
+    """
     results = [
         FingerprintResult(
             status=FingerprintStatus.no_match,
@@ -306,6 +361,7 @@ def parse_audfprint_batch_output(
         )
         for ts in window_start_utc
     ]
+    best_count: list[int] = [-1] * len(window_start_utc)
     query_to_index: dict[str, int] = {}
     for i, path in enumerate(query_paths):
         query_to_index[str(path)] = i
@@ -324,7 +380,7 @@ def parse_audfprint_batch_output(
             parts = line.split()
             if len(parts) >= 2:
                 idx = lookup(parts[1])
-                if idx is not None:
+                if idx is not None and results[idx].status is not FingerprintStatus.match:
                     results[idx] = FingerprintResult(
                         status=FingerprintStatus.no_match,
                         window_start_utc=window_start_utc[idx],
@@ -335,10 +391,12 @@ def parse_audfprint_batch_output(
         if not m:
             continue
         idx = lookup(m.group("query").strip())
-        if idx is None or results[idx].status is FingerprintStatus.match:
+        if idx is None:
+            continue
+        count = int(m.group("count"))
+        if count <= best_count[idx]:
             continue
         track = m.group("track").strip()
-        count = int(m.group("count"))
         artist, title = _split_track_id(track)
         results[idx] = FingerprintResult(
             status=FingerprintStatus.match,
@@ -348,6 +406,7 @@ def parse_audfprint_batch_output(
             title=title,
             match_score=float(count),
         )
+        best_count[idx] = count
 
     return results
 

@@ -161,6 +161,22 @@ def test_upsert_song_is_case_insensitive(tmp_path: Path) -> None:
         assert n == 1
 
 
+def test_upsert_song_is_unicode_casefold_insensitive(tmp_path: Path) -> None:
+    """SQLite LOWER() is ASCII-only, so non-ASCII Shazam text needs the same
+    Unicode-aware normalization as Python before we try to insert again.
+    """
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        first = store.upsert_song(artist="MÀREL", title="the wave", source="shazam")
+        second = store.upsert_song(artist="màrel", title="the wave", source="shazam")
+
+        assert first == second
+        n = store.connection.execute(
+            "SELECT COUNT(*) FROM songs"
+        ).fetchone()[0]
+        assert n == 1
+
+
 def test_upsert_song_prefers_canonical_artist_display_casing(tmp_path: Path) -> None:
     """Known all-caps Shazam artist artifacts should be cleaned on write.
 
