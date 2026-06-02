@@ -22,6 +22,8 @@ def persist_input(
     reducer: SegmentReducer,
     store: BroadcastStore | None,
     inp: SegmentInput | None,
+    *,
+    capture_run_id: int | None = None,
 ) -> list[int]:
     """Apply one window's :class:`SegmentInput` to the reducer; persist closures.
 
@@ -36,7 +38,7 @@ def persist_input(
         return []
     new_ids: list[int] = []
     for t in reducer.feed(inp):
-        new_ids.append(_persist_one(store, t))
+        new_ids.append(_persist_one(store, t, capture_run_id=capture_run_id))
     return new_ids
 
 
@@ -46,18 +48,24 @@ def persist_finalize(
     *,
     last_window_start_utc: str,
     window_seconds: float,
+    capture_run_id: int | None = None,
 ) -> list[int]:
     """Close any final open segment after processing all windows."""
     if store is None:
         return []
     new_ids: list[int] = []
     for t in reducer.finalize(last_window_start_utc, window_seconds):
-        new_ids.append(_persist_one(store, t))
+        new_ids.append(_persist_one(store, t, capture_run_id=capture_run_id))
     return new_ids
 
 
-def _persist_one(store: BroadcastStore, t: SegmentTransition) -> int:
+def _persist_one(
+    store: BroadcastStore,
+    t: SegmentTransition,
+    *,
+    capture_run_id: int | None = None,
+) -> int:
     """Resolve foreign keys then insert."""
     if t.brand_id is None and t.brand_name:
         t.brand_id = _resolve_brand_id(store, t.brand_name)
-    return store.apply_transition(t)
+    return store.apply_transition(t, capture_run_id=capture_run_id)

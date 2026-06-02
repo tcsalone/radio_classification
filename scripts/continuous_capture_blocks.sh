@@ -90,6 +90,7 @@ DEVICE_INDEX="${DEVICE_INDEX:-0}"
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
 TOTAL_SECONDS=$((BLOCK_COUNT * BLOCK_SECONDS))
 
+RUN_STARTED_ISO="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
 RUN_START_UTC="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${RUN_ID:-continuous_${RUN_START_UTC}_${BLOCK_COUNT}x$((BLOCK_SECONDS / 60))m}"
 RUN_DIR="data/captures/${RUN_ID}"
@@ -134,6 +135,13 @@ echo "capture_log=$CAPTURE_LOG"
 echo "skips_log=$SKIPS_LOG"
 
 .venv/bin/python -m radio_classifier db init --db-path "$DB_PATH" >/dev/null
+CAPTURE_RUN_DB_ID="$(
+  .venv/bin/python -m radio_classifier runs start \
+    --db-path "$DB_PATH" \
+    --run-id "$RUN_ID" \
+    --started-utc "$RUN_STARTED_ISO"
+)"
+echo "capture_run_id=$CAPTURE_RUN_DB_ID"
 
 echo
 echo "=== continuous capture start ==="
@@ -223,9 +231,13 @@ for i in $(seq 1 "$BLOCK_COUNT"); do
       --enable-shazam \
       --persist \
       --db-path "$DB_PATH" \
+      --capture-run-id "$CAPTURE_RUN_DB_ID" \
       --progress \
       2>&1 | tee "$cls_log"; then
     COMPLETED=$((COMPLETED + 1))
+    if [[ -x scripts/prune_old_wavs.sh ]]; then
+      RETENTION_DAYS="${RETENTION_DAYS:-7}" scripts/prune_old_wavs.sh data/captures || true
+    fi
   else
     CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
     echo "block ${i}: classify FAILED (see ${cls_log})" | tee -a "$SKIPS_LOG" >&2
@@ -245,6 +257,10 @@ echo "blocks with classify failure: ${CLASSIFY_FAILED}"
 if [[ -s "$SKIPS_LOG" ]]; then
   echo "skip log: $SKIPS_LOG"
 fi
+.venv/bin/python -m radio_classifier runs end \
+  --db-path "$DB_PATH" \
+  --run-id "$RUN_ID" \
+  --ended-utc "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >/dev/null
 
 if (( COMPLETED > 0 )); then
   echo

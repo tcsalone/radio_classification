@@ -30,6 +30,7 @@ def test_help_lists_subcommands() -> None:
         "db",
         "fingerprint",
         "capture",
+        "runs",
         "classify",
         "ingest",
         "report",
@@ -51,6 +52,7 @@ def test_classify_help_documents_audfprint_min_count() -> None:
     proc = _run("classify", "--help")
     assert proc.returncode == 0, proc.stderr
     assert "--audfprint-min-count" in proc.stdout
+    assert "--capture-run-id" in proc.stdout
     assert "default: 45" in proc.stdout
 
 
@@ -460,6 +462,140 @@ def test_db_init_creates_v3_schema(tmp_path: Path) -> None:
             "brand_mentions",
             "capture_runs",
         } <= tables
+
+
+def test_default_db_path_is_persistent_store() -> None:
+    from radio_classifier.cli import _default_db_path
+
+    path = _default_db_path()
+    assert path.name == "broadcast.db"
+    assert path.parent.name == "store"
+
+
+def test_runs_start_end_list(tmp_path: Path) -> None:
+    db_path = tmp_path / "broadcast.db"
+    init = _run("db", "init", "--db-path", str(db_path))
+    assert init.returncode == 0, init.stderr
+
+    start = _run(
+        "runs",
+        "start",
+        "--db-path",
+        str(db_path),
+        "--run-id",
+        "continuous_test",
+        "--started-utc",
+        "2026-06-01T00:00:00.000Z",
+        "--pipeline-version",
+        "0.3.0+test",
+        "--host",
+        "pytest",
+    )
+    assert start.returncode == 0, start.stderr
+    capture_run_id = int(start.stdout.strip())
+    assert capture_run_id > 0
+
+    end = _run(
+        "runs",
+        "end",
+        "--db-path",
+        str(db_path),
+        "--run-id",
+        "continuous_test",
+        "--ended-utc",
+        "2026-06-01T00:30:00.000Z",
+        "--notes",
+        "done",
+    )
+    assert end.returncode == 0, end.stderr
+
+    listed = _run("runs", "list", "--db-path", str(db_path))
+    assert listed.returncode == 0, listed.stderr
+    assert "continuous_test" in listed.stdout
+    assert "0.3.0+test" in listed.stdout
+
+
+def test_report_songs_added_filters_explicit_window(tmp_path: Path) -> None:
+    from radio_classifier.persistence import BroadcastStore
+
+    db_path = tmp_path / "broadcast.db"
+    with BroadcastStore(db_path, use_wal=False) as store:
+        old_id = store.upsert_song(artist="Old Artist", title="Old Song", source="manual")
+        new_id = store.upsert_song(artist="New Artist", title="New Song", source="shazam")
+        store.connection.execute(
+            "UPDATE songs SET first_seen_utc = ? WHERE id = ?",
+            ("2026-05-01T00:00:00.000Z", old_id),
+        )
+        store.connection.execute(
+            "UPDATE songs SET first_seen_utc = ? WHERE id = ?",
+            ("2026-06-01T12:00:00.000Z", new_id),
+        )
+        store.connection.commit()
+
+    proc = _run(
+        "report",
+        "songs-added",
+        "--db-path",
+        str(db_path),
+        "--from",
+        "2026-06-01T00:00:00.000Z",
+        "--to",
+        "2026-06-02T00:00:00.000Z",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "New Artist" in proc.stdout
+    assert "Old Artist" not in proc.stdout
+
+
+def test_report_runs_lists_capture_runs(tmp_path: Path) -> None:
+    db_path = tmp_path / "broadcast.db"
+    init = _run("db", "init", "--db-path", str(db_path))
+    assert init.returncode == 0, init.stderr
+    start = _run(
+        "runs",
+        "start",
+        "--db-path",
+        str(db_path),
+        "--run-id",
+        "continuous_report_test",
+        "--started-utc",
+        "2026-06-01T12:00:00.000Z",
+        "--pipeline-version",
+        "0.3.0+test",
+    )
+    assert start.returncode == 0, start.stderr
+
+    proc = _run(
+        "report",
+        "runs",
+        "--db-path",
+        str(db_path),
+        "--from",
+        "2026-06-01T00:00:00.000Z",
+        "--to",
+        "2026-06-02T00:00:00.000Z",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "continuous_report_test" in proc.stdout
+    assert "0.3.0+test" in proc.stdout
+
+
+def test_report_rejects_since_with_from(tmp_path: Path) -> None:
+    db_path = tmp_path / "broadcast.db"
+    init = _run("db", "init", "--db-path", str(db_path))
+    assert init.returncode == 0, init.stderr
+    proc = _run(
+        "report",
+        "summary",
+        "--db-path",
+        str(db_path),
+        "--since",
+        "1d",
+        "--from",
+        "2026-06-01T00:00:00.000Z",
+    )
+    assert proc.returncode == 2
+    assert "either --since or --from/--to" in proc.stderr
 
 
 def test_report_summary_empty_db(tmp_path: Path) -> None:

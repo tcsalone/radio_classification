@@ -1,5 +1,49 @@
 # Next Session — Discussion Topics
 
+## Current Handoff (2026-06-01)
+
+Always-on capture store work is through Phase 4 locally:
+
+- Phase 1: schema v3, `capture_runs`, automatic v2 to v3 migration, and
+  pipeline version provenance are implemented.
+- Phase 2: `capture_forever.sh`, `continuous_capture_blocks.sh --append-db`,
+  `runs` CLI commands, and sidecar-aware WAV retention are implemented.
+- Phase 3: report windows now support `--from` / `--to`, with new
+  `report songs-added` and `report runs` commands.
+- Phase 4: operator guidance now lives in `OPERATIONS.md`.
+
+Primary operating path:
+
+```bash
+./scripts/capture_forever.sh
+```
+
+Default persistent database:
+
+```bash
+data/store/broadcast.db
+```
+
+Useful first checks next session:
+
+```bash
+.venv/bin/python -m radio_classifier report runs --since 7d
+.venv/bin/python -m radio_classifier report summary --since 24h
+sqlite3 data/store/broadcast.db "SELECT value FROM schema_meta WHERE key = 'version';"
+```
+
+Backup before long or risky maintenance:
+
+```bash
+mkdir -p data/backups
+sqlite3 data/store/broadcast.db \
+  ".backup 'data/backups/broadcast-$(date -u +%Y%m%dT%H%M%SZ).db'"
+```
+
+To stop long-running capture cleanly, press `Ctrl-C` in the terminal running
+`capture_forever.sh`. See `OPERATIONS.md` for retention and manual run-close
+commands.
+
 Captured 2026-05-30. Topics to work through next time we sit down for planning.
 
 ## Priority items (carried over from previous session)

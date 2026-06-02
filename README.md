@@ -86,6 +86,9 @@ Run tests:
 pytest -q
 ```
 
+For long-running collection, persistent-store backups, retention, and recovery
+commands, see [`OPERATIONS.md`](OPERATIONS.md).
+
 ## Quickstart
 
 ```bash

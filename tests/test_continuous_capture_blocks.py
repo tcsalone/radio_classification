@@ -88,6 +88,13 @@ def _write_stub_python(stub_dir: Path) -> Path:
               exit 0
             fi
 
+            if [[ "$SUBCMD" == "runs" ]]; then
+              if [[ "${{args[*]}}" == *" start "* ]]; then
+                echo "123"
+              fi
+              exit 0
+            fi
+
             if [[ "$SUBCMD" == "capture" && "$CAPTURE_SUBCMD" == "chunks" ]]; then
               mkdir -p "$OUT_DIR"
               for i in 1 2; do
@@ -121,6 +128,8 @@ def test_continuous_capture_script_classifies_completed_chunks(tmp_path: Path) -
     assert "continuous capture start" in proc.stdout
     assert "capture_start_utc=2020-01-01T00:00:00.000Z" in proc.stdout
     assert "capture_start_utc=2020-01-01T00:00:01.000Z" in proc.stdout
+    assert "capture_run_id=123" in proc.stdout
+    assert "--capture-run-id 123" in proc.stdout
     assert "blocks classified: 2/2" in proc.stdout
     assert "combined reports" in proc.stdout
 

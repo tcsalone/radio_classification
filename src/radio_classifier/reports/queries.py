@@ -273,14 +273,47 @@ class SummaryRow:
     total_duration_seconds: float
 
 
+@dataclass
+class SongsAddedRow:
+    song_id: int
+    first_seen_utc: str
+    artist: str | None
+    title: str | None
+    source: str
+    spin_count: int
+    segment_count: int
+
+
+@dataclass
+class RunRow:
+    capture_run_id: int
+    run_id: str
+    started_utc: str
+    ended_utc: str | None
+    pipeline_version: str
+    event_count: int
+    duration_seconds: float | None
+
+
+def _window_clause(column: str, since_utc: str, until_utc: str | None = None) -> tuple[str, list[str]]:
+    clause = f"{column} >= ?"
+    args = [since_utc]
+    if until_utc:
+        clause += f" AND {column} < ?"
+        args.append(until_utc)
+    return clause, args
+
+
 # -------------------------------------------------------------------- queries
 def commercials_top(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     top_n: int = 10,
     brand: str | None = None,
 ) -> list[CommercialRow]:
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
     sql = """
         SELECT
             e.commercial_id AS commercial_id,
@@ -292,9 +325,8 @@ def commercials_top(
         FROM broadcast_events e
         LEFT JOIN commercials c ON e.commercial_id = c.id
         LEFT JOIN brands b ON COALESCE(c.brand_id, e.brand_id) = b.id
-        WHERE e.category = 'COMMERCIAL' AND e.timestamp_start >= ?
-    """
-    args: list = [since_utc]
+        WHERE e.category = 'COMMERCIAL' AND {window_clause}
+    """.format(window_clause=window_clause)
     if brand:
         sql += " AND b.canonical_name = ?"
         args.append(brand)
@@ -322,8 +354,10 @@ def brands_top(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     top_n: int = 10,
 ) -> list[BrandRow]:
+    window_clause, args = _window_clause("bm.heard_utc", since_utc, until_utc)
     sql = """
         SELECT
             b.canonical_name AS brand,
@@ -332,12 +366,13 @@ def brands_top(
             SUM(CASE WHEN bm.mention_type = 'tag' THEN 1 ELSE 0 END) AS tag
         FROM brand_mentions bm
         JOIN brands b ON bm.brand_id = b.id
-        WHERE bm.heard_utc >= ?
+        WHERE {window_clause}
         GROUP BY b.canonical_name
         ORDER BY (paid_ad + dj_shoutout + tag) DESC, brand ASC
         LIMIT ?
-    """
-    rows = store.connection.execute(sql, (since_utc, top_n)).fetchall()
+    """.format(window_clause=window_clause)
+    args.append(top_n)
+    rows = store.connection.execute(sql, args).fetchall()
     return [
         BrandRow(
             brand=str(r[0]),
@@ -353,6 +388,7 @@ def songs_top(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     top_n: int = 10,
     spin_merge_gap_seconds: float | None = None,
 ) -> list[SongRow]:
@@ -369,6 +405,7 @@ def songs_top(
     merge window.
     """
     gap = SPIN_MERGE_GAP_SECONDS if spin_merge_gap_seconds is None else float(spin_merge_gap_seconds)
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
     raw = store.connection.execute(
         """
         SELECT
@@ -380,10 +417,10 @@ def songs_top(
             e.duration
         FROM broadcast_events e
         LEFT JOIN songs s ON e.song_id = s.id
-        WHERE e.category = 'SONG' AND e.timestamp_start >= ?
+        WHERE e.category = 'SONG' AND {window_clause}
         ORDER BY e.song_id IS NULL, e.song_id, e.timestamp_start ASC
-        """,
-        (since_utc,),
+        """.format(window_clause=window_clause),
+        args,
     ).fetchall()
 
     bucket: dict[tuple[int | None, str | None, str | None], list[tuple[str, str | None, float | None]]] = {}
@@ -437,6 +474,7 @@ def songs_timeline(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     limit: int = 500,
 ) -> list[SongTimelineRow]:
     """Return SONG events in broadcast order.
@@ -445,6 +483,8 @@ def songs_timeline(
     spins. It is a raw chronological listening log for manual review and
     debugging.
     """
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    args.append(limit)
     rows = store.connection.execute(
         """
         SELECT
@@ -458,11 +498,11 @@ def songs_timeline(
             COALESCE(s.source, 'unknown') AS detection_source
         FROM broadcast_events e
         LEFT JOIN songs s ON e.song_id = s.id
-        WHERE e.category = 'SONG' AND e.timestamp_start >= ?
+        WHERE e.category = 'SONG' AND {window_clause}
         ORDER BY e.timestamp_start ASC
         LIMIT ?
-        """,
-        (since_utc, limit),
+        """.format(window_clause=window_clause),
+        args,
     ).fetchall()
     return [
         SongTimelineRow(
@@ -493,6 +533,7 @@ def artists_top(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     top_n: int = 10,
     spin_merge_gap_seconds: float | None = None,
 ) -> list[ArtistRow]:
@@ -510,6 +551,7 @@ def artists_top(
     segment_count=2``.
     """
     gap = SPIN_MERGE_GAP_SECONDS if spin_merge_gap_seconds is None else float(spin_merge_gap_seconds)
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
     raw = store.connection.execute(
         """
         SELECT
@@ -521,10 +563,10 @@ def artists_top(
             e.duration
         FROM broadcast_events e
         LEFT JOIN songs s ON e.song_id = s.id
-        WHERE e.category = 'SONG' AND e.timestamp_start >= ?
+        WHERE e.category = 'SONG' AND {window_clause}
         ORDER BY e.timestamp_start ASC
-        """,
-        (since_utc,),
+        """.format(window_clause=window_clause),
+        args,
     ).fetchall()
 
     # Per artist: track each (song_id, title) sub-bucket separately so we can
@@ -607,8 +649,11 @@ def timeline(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     limit: int = 500,
 ) -> list[TimelineRow]:
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    args.append(limit)
     sql = """
         SELECT
             e.timestamp_start,
@@ -622,11 +667,11 @@ def timeline(
         FROM broadcast_events e
         LEFT JOIN brands b ON e.brand_id = b.id
         LEFT JOIN songs s ON e.song_id = s.id
-        WHERE e.timestamp_start >= ?
+        WHERE {window_clause}
         ORDER BY e.timestamp_start ASC
         LIMIT ?
-    """
-    rows = store.connection.execute(sql, (since_utc, limit)).fetchall()
+    """.format(window_clause=window_clause)
+    rows = store.connection.execute(sql, args).fetchall()
     return [
         TimelineRow(
             start_utc=str(r[0]),
@@ -646,17 +691,19 @@ def summary(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
 ) -> list[SummaryRow]:
+    window_clause, args = _window_clause("timestamp_start", since_utc, until_utc)
     sql = """
         SELECT category,
                COUNT(*) AS segment_count,
                COALESCE(SUM(duration), 0.0) AS total_duration
         FROM broadcast_events
-        WHERE timestamp_start >= ?
+        WHERE {window_clause}
         GROUP BY category
         ORDER BY total_duration DESC
-    """
-    rows = store.connection.execute(sql, (since_utc,)).fetchall()
+    """.format(window_clause=window_clause)
+    rows = store.connection.execute(sql, args).fetchall()
     return [
         SummaryRow(
             category=str(r[0]),
@@ -665,3 +712,97 @@ def summary(
         )
         for r in rows
     ]
+
+
+def songs_added(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+    source: str | None = None,
+    top_n: int = 50,
+) -> list[SongsAddedRow]:
+    song_window, args = _window_clause("s.first_seen_utc", since_utc, until_utc)
+    event_window, event_args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    args = event_args + args
+    where = [song_window]
+    if source:
+        where.append("s.source = ?")
+        args.append(source)
+    args.append(top_n)
+    sql = """
+        SELECT
+            s.id,
+            s.first_seen_utc,
+            s.artist,
+            s.title,
+            s.source,
+            COUNT(e.id) AS segment_count
+        FROM songs s
+        LEFT JOIN broadcast_events e
+          ON e.song_id = s.id
+         AND {event_window}
+        WHERE {where_clause}
+        GROUP BY s.id
+        ORDER BY s.first_seen_utc DESC, s.id DESC
+        LIMIT ?
+    """.format(event_window=event_window, where_clause=" AND ".join(where))
+    rows = store.connection.execute(sql, args).fetchall()
+    return [
+        SongsAddedRow(
+            song_id=int(r[0]),
+            first_seen_utc=str(r[1]),
+            artist=r[2],
+            title=r[3],
+            source=str(r[4]),
+            spin_count=int(r[5] or 0),
+            segment_count=int(r[5] or 0),
+        )
+        for r in rows
+    ]
+
+
+def runs_summary(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+    top_n: int = 50,
+) -> list[RunRow]:
+    window_clause, args = _window_clause("cr.started_utc", since_utc, until_utc)
+    args.append(top_n)
+    rows = store.connection.execute(
+        """
+        SELECT
+            cr.id,
+            cr.run_id,
+            cr.started_utc,
+            cr.ended_utc,
+            cr.pipeline_version,
+            COUNT(be.id) AS event_count
+        FROM capture_runs cr
+        LEFT JOIN broadcast_events be ON be.capture_run_id = cr.id
+        WHERE {window_clause}
+        GROUP BY cr.id
+        ORDER BY cr.started_utc DESC, cr.id DESC
+        LIMIT ?
+        """.format(window_clause=window_clause),
+        args,
+    ).fetchall()
+    out: list[RunRow] = []
+    for r in rows:
+        duration = None
+        if r[3]:
+            duration = (_parse_iso_utc(str(r[3])) - _parse_iso_utc(str(r[2]))).total_seconds()
+        out.append(
+            RunRow(
+                capture_run_id=int(r[0]),
+                run_id=str(r[1]),
+                started_utc=str(r[2]),
+                ended_utc=r[3],
+                pipeline_version=str(r[4]),
+                event_count=int(r[5] or 0),
+                duration_seconds=duration,
+            )
+        )
+    return out

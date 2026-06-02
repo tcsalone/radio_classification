@@ -3,13 +3,14 @@
 Subcommands:
 
 * ``prereq-check``  — diagnostics for GPU / CUDA / Ollama / rtl_fm / audfprint.
-* ``db init``        — apply ``db/schema.sql`` (schema v2) to a SQLite file.
-* ``db migrate-from-live105sux`` — port a live105sux v1 SQLite into v2.
+* ``db init``        — apply ``db/schema.sql`` (schema v3) to a SQLite file.
+* ``db migrate-from-live105sux`` — port a live105sux v1 SQLite into the current schema.
 * ``fingerprint index`` — build / extend the audfprint song index.
 * ``fingerprint eval``  — run the recall harness against a truth CSV.
 * ``ingest``         — live RTL-SDR capture through the 3-tier funnel.
 * ``capture chunks`` — continuous RTL-SDR capture into fixed WAV chunks.
 * ``classify``       — offline 3-tier funnel on a WAV file.
+* ``runs``           — open/close/list capture-run provenance rows.
 * ``report``         — CLI-only reports (commercials / brands / songs / artists / timeline / summary).
 * ``seed scrape``    — print a tracklist parsed from a station page.
 * ``seed download``  — fetch reference audio via yt-dlp (``[seeding]``).
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import wave
@@ -39,6 +41,7 @@ from radio_classifier.ingest.wav import read_mono_s16le_wav, write_mono_s16le_wa
 from radio_classifier.ingest.windows import iter_overlapping_windows
 from radio_classifier.persistence import BroadcastStore, persist_finalize, persist_input
 from radio_classifier.segments import SegmentReducer
+from radio_classifier.version import pipeline_version
 
 
 def _project_root() -> Path:
@@ -47,7 +50,7 @@ def _project_root() -> Path:
 
 
 def _default_db_path() -> Path:
-    return _project_root() / "data" / "radio_classifier.db"
+    return _project_root() / "data" / "store" / "broadcast.db"
 
 
 class _CliConfigError(ValueError):
@@ -125,18 +128,25 @@ def _parse_utc_time_ns(value: str) -> int:
     return int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
 
 
+def _normalize_utc_text(value: str) -> str:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 # --------------------------------------------------------------------- parser
 def _add_persist_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--persist",
         action="store_true",
-        help="Append segment rows to SQLite (default DB: data/radio_classifier.db)",
+        help="Append segment rows to SQLite (default DB: data/store/broadcast.db)",
     )
     p.add_argument(
         "--db-path",
         type=Path,
         default=None,
-        help="SQLite database file (default: <repo>/data/radio_classifier.db)",
+        help="SQLite database file (default: <repo>/data/store/broadcast.db)",
     )
     p.add_argument(
         "--no-wal",
@@ -309,11 +319,11 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- db
     db = sub.add_parser("db", help="Database management")
     db_sub = db.add_subparsers(dest="db_command", required=True)
-    db_init = db_sub.add_parser("init", help="Initialise SQLite schema v2")
+    db_init = db_sub.add_parser("init", help="Initialise SQLite schema v3")
     db_init.add_argument("--db-path", type=Path, default=None)
 
     mig = db_sub.add_parser(
-        "migrate-from-live105sux", help="Migrate a live105sux v1 DB into a fresh v2 DB"
+        "migrate-from-live105sux", help="Migrate a live105sux v1 DB into a fresh radio-classifier DB"
     )
     mig.add_argument("--src", type=Path, required=True, help="Source live105sux SQLite path")
     mig.add_argument("--dst", type=Path, required=True, help="Destination radio-classifier SQLite path")
@@ -366,6 +376,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "classification of continuously captured chunks so DB events use "
             "broadcast time instead of classification time."
         ),
+    )
+    cls.add_argument(
+        "--capture-run-id",
+        type=int,
+        default=None,
+        help="capture_runs.id to stamp onto persisted broadcast_events",
     )
     _add_window_arguments(cls)
     _add_funnel_arguments(cls)
@@ -422,18 +438,41 @@ def _build_parser() -> argparse.ArgumentParser:
     cap_chunks.add_argument("--out-dir", type=Path, required=True)
     cap_chunks.add_argument("--run-id", type=str, default=None)
 
+    # ---- runs (capture-run provenance)
+    runs = sub.add_parser("runs", help="Manage capture run provenance rows")
+    runs_sub = runs.add_subparsers(dest="runs_command", required=True)
+    runs_start = runs_sub.add_parser("start", help="Open a capture run row")
+    runs_start.add_argument("--db-path", type=Path, default=None)
+    runs_start.add_argument("--run-id", type=str, required=True)
+    runs_start.add_argument("--started-utc", type=str, default=None)
+    runs_start.add_argument("--pipeline-version", type=str, default=None)
+    runs_start.add_argument("--host", type=str, default=None)
+    runs_start.add_argument("--notes", type=str, default=None)
+
+    runs_end = runs_sub.add_parser("end", help="Close a capture run row")
+    runs_end.add_argument("--db-path", type=Path, default=None)
+    runs_end.add_argument("--run-id", type=str, required=True)
+    runs_end.add_argument("--ended-utc", type=str, default=None)
+    runs_end.add_argument("--notes", type=str, default=None)
+
+    runs_list = runs_sub.add_parser("list", help="List recent capture runs")
+    runs_list.add_argument("--db-path", type=Path, default=None)
+    runs_list.add_argument("--limit", type=int, default=20)
+
     # ---- report
-    rep = sub.add_parser("report", help="CLI reports against a v2 SQLite DB")
+    rep = sub.add_parser("report", help="CLI reports against a radio-classifier SQLite DB")
     rep_sub = rep.add_subparsers(dest="report_command", required=True)
     for name in (
         "commercials",
         "brands",
         "songs",
+        "songs-added",
         "songs-timeline",
         "artists",
         "timeline",
         "summary",
         "dashboard",
+        "runs",
     ):
         help_text = None
         if name == "artists":
@@ -443,14 +482,28 @@ def _build_parser() -> argparse.ArgumentParser:
             )
         elif name == "songs-timeline":
             help_text = "Chronological SONG-only listening log"
+        elif name == "songs-added":
+            help_text = "Songs first added to the catalog in a time window"
         elif name == "dashboard":
             help_text = "Write a static HTML metrics dashboard"
+        elif name == "runs":
+            help_text = "Capture run provenance summary"
         r = rep_sub.add_parser(name, help=help_text)
         r.add_argument("--db-path", type=Path, default=None)
-        r.add_argument("--since", type=str, default="24h")
+        r.add_argument("--since", type=str, default=None, help="Window start as duration/ISO (default: 24h)")
+        r.add_argument("--from", dest="from_utc", type=str, default=None, help="Explicit inclusive UTC window start")
+        r.add_argument("--to", dest="until_utc", type=str, default=None, help="Explicit exclusive UTC window end")
         r.add_argument("--top", type=int, default=10, help="Limit (default 10)")
         if name == "commercials":
             r.add_argument("--brand", type=str, default=None, help="Filter to a single brand")
+        if name == "songs-added":
+            r.add_argument(
+                "--source",
+                type=str,
+                choices=("audfprint", "shazam", "manual"),
+                default=None,
+                help="Filter by songs.source",
+            )
         if name in {"timeline", "songs-timeline"}:
             r.add_argument("--limit", type=int, default=500)
         if name == "dashboard":
@@ -813,14 +866,20 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
         shazam_recheck_windows=max(1, args.shazam_recheck_windows),
     )
 
-    return FunnelBundle(orchestrator=orchestrator, store=store, reducer=reducer)
+    return FunnelBundle(
+        orchestrator=orchestrator,
+        store=store,
+        reducer=reducer,
+        capture_run_id=getattr(args, "capture_run_id", None),
+    )
 
 
 class FunnelBundle:
-    def __init__(self, *, orchestrator, store, reducer) -> None:
+    def __init__(self, *, orchestrator, store, reducer, capture_run_id: int | None = None) -> None:
         self.orchestrator = orchestrator
         self.store = store
         self.reducer = reducer
+        self.capture_run_id = capture_run_id
 
     def close(self, *, windows: list, window_seconds: float) -> None:
         try:
@@ -830,6 +889,7 @@ class FunnelBundle:
                     self.store,
                     last_window_start_utc=windows[-1].window_start_utc,
                     window_seconds=window_seconds,
+                    capture_run_id=self.capture_run_id,
                 )
         finally:
             if self.store is not None:
@@ -1187,7 +1247,12 @@ def cmd_classify(args: argparse.Namespace) -> int:
             _emit_funnel(args, r, window_seconds=args.window_seconds)
             progress.observe(idx, r)
             if bundle.reducer is not None:
-                new_ids = persist_input(bundle.reducer, bundle.store, r.segment_input)
+                new_ids = persist_input(
+                    bundle.reducer,
+                    bundle.store,
+                    r.segment_input,
+                    capture_run_id=bundle.capture_run_id,
+                )
                 if new_ids:
                     # mentions belong to the window that closed the *previous* segment
                     _persist_brand_mentions(
@@ -1274,7 +1339,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             r = bundle.orchestrator.process(w)
             _emit_funnel(args, r, window_seconds=args.window_seconds)
             if bundle.reducer is not None:
-                new_ids = persist_input(bundle.reducer, bundle.store, r.segment_input)
+                new_ids = persist_input(
+                    bundle.reducer,
+                    bundle.store,
+                    r.segment_input,
+                    capture_run_id=bundle.capture_run_id,
+                )
                 if new_ids:
                     _persist_brand_mentions(
                         bundle.store,
@@ -1446,7 +1516,91 @@ def cmd_capture_chunks(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- runs
+def cmd_runs(args: argparse.Namespace) -> int:
+    db_path = _resolve_db_path(args.db_path)
+    if args.runs_command == "start":
+        started_utc = args.started_utc or _iso_from_time_ns(time.time_ns())
+        version = args.pipeline_version or pipeline_version()
+        host = args.host or socket.gethostname()
+        with BroadcastStore(db_path) as store:
+            capture_run_id = store.open_capture_run(
+                run_id=args.run_id,
+                started_utc=started_utc,
+                pipeline_version=version,
+                host=host,
+                notes=args.notes,
+            )
+        print(capture_run_id)
+        return 0
+
+    if args.runs_command == "end":
+        ended_utc = args.ended_utc or _iso_from_time_ns(time.time_ns())
+        with BroadcastStore(db_path) as store:
+            store.close_capture_run(
+                run_id=args.run_id,
+                ended_utc=ended_utc,
+                notes=args.notes,
+            )
+        print(f"radio-classifier: closed capture run {args.run_id}", file=sys.stderr)
+        return 0
+
+    if args.runs_command == "list":
+        if not db_path.exists():
+            print(f"radio-classifier runs list: db not found: {db_path}", file=sys.stderr)
+            return 1
+        with BroadcastStore(db_path) as store:
+            rows = store.connection.execute(
+                """
+                SELECT
+                    cr.id,
+                    cr.run_id,
+                    cr.started_utc,
+                    cr.ended_utc,
+                    cr.pipeline_version,
+                    COUNT(be.id) AS event_count
+                FROM capture_runs cr
+                LEFT JOIN broadcast_events be ON be.capture_run_id = cr.id
+                GROUP BY cr.id
+                ORDER BY cr.started_utc DESC, cr.id DESC
+                LIMIT ?
+                """,
+                (max(1, int(args.limit)),),
+            ).fetchall()
+        if not rows:
+            print("(no rows)")
+            return 0
+        print("id  run_id                         started_utc               ended_utc                 events  pipeline")
+        print("--  -----------------------------  ------------------------  ------------------------  ------  --------")
+        for row in rows:
+            print(
+                f"{int(row[0]):<3} "
+                f"{str(row[1])[:29]:<29}  "
+                f"{str(row[2] or ''):<24}  "
+                f"{str(row[3] or ''):<24}  "
+                f"{int(row[5]):<6}  "
+                f"{row[4]}"
+            )
+        return 0
+
+    print("radio-classifier runs: unknown subcommand", file=sys.stderr)
+    return 2
+
+
 # ------------------------------------------------------------------ report
+def _report_window(args: argparse.Namespace, parse_since_fn) -> tuple[str, str | None]:
+    if (args.from_utc or args.until_utc) and args.since:
+        raise _CliConfigError("report window accepts either --since or --from/--to, not both")
+    if args.from_utc:
+        since_utc = _normalize_utc_text(args.from_utc)
+    else:
+        since_utc = parse_since_fn(args.since or "24h")
+    until_utc = _normalize_utc_text(args.until_utc) if args.until_utc else None
+    if until_utc is not None and until_utc <= since_utc:
+        raise _CliConfigError("--to must be later than the report window start")
+    return since_utc, until_utc
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     from radio_classifier.reports import (
         artists_top,
@@ -1455,11 +1609,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         format_artists,
         format_brands,
         format_commercials,
+        format_runs,
         format_songs,
+        format_songs_added,
         format_songs_timeline,
         format_summary,
         format_timeline,
         parse_since,
+        runs_summary,
+        songs_added,
         songs_timeline,
         songs_top,
         summary,
@@ -1471,35 +1629,51 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not db_path.exists():
         print(f"radio-classifier report: db not found: {db_path}", file=sys.stderr)
         return 1
-    since_utc = parse_since(args.since)
+    since_utc, until_utc = _report_window(args, parse_since)
     with BroadcastStore(db_path) as store:
         if args.report_command == "commercials":
             rows = commercials_top(
                 store,
                 since_utc=since_utc,
+                until_utc=until_utc,
                 top_n=args.top,
                 brand=getattr(args, "brand", None),
             )
             print(format_commercials(rows))
         elif args.report_command == "brands":
-            rows = brands_top(store, since_utc=since_utc, top_n=args.top)
+            rows = brands_top(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
             print(format_brands(rows))
         elif args.report_command == "songs":
-            rows = songs_top(store, since_utc=since_utc, top_n=args.top)
+            rows = songs_top(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
             print(format_songs(rows))
+        elif args.report_command == "songs-added":
+            rows = songs_added(
+                store,
+                since_utc=since_utc,
+                until_utc=until_utc,
+                source=args.source,
+                top_n=args.top,
+            )
+            print(format_songs_added(rows))
         elif args.report_command == "songs-timeline":
-            rows = songs_timeline(store, since_utc=since_utc, limit=args.limit)
+            rows = songs_timeline(store, since_utc=since_utc, until_utc=until_utc, limit=args.limit)
             print(format_songs_timeline(rows))
         elif args.report_command == "artists":
-            rows = artists_top(store, since_utc=since_utc, top_n=args.top)
+            rows = artists_top(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
             print(format_artists(rows))
         elif args.report_command == "timeline":
-            rows = timeline(store, since_utc=since_utc, limit=args.limit)
+            rows = timeline(store, since_utc=since_utc, until_utc=until_utc, limit=args.limit)
             print(format_timeline(rows))
         elif args.report_command == "summary":
-            rows = summary(store, since_utc=since_utc)
+            rows = summary(store, since_utc=since_utc, until_utc=until_utc)
             print(format_summary(rows))
+        elif args.report_command == "runs":
+            rows = runs_summary(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
+            print(format_runs(rows))
         elif args.report_command == "dashboard":
+            if until_utc is not None:
+                print("radio-classifier report dashboard: --to is not supported yet", file=sys.stderr)
+                return 2
             out_path = args.out or (_project_root() / "data" / "reports" / "dashboard.html")
             written = write_dashboard(
                 store,
@@ -1814,6 +1988,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.capture_command == "chunks":
                 return cmd_capture_chunks(args)
             return 2
+        if args.command == "runs":
+            return cmd_runs(args)
         if args.command == "report":
             return cmd_report(args)
         if args.command == "seed":

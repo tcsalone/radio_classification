@@ -7,6 +7,8 @@ from radio_classifier.reports.queries import (
     ArtistRow,
     BrandRow,
     CommercialRow,
+    RunRow,
+    SongsAddedRow,
     SongRow,
     SongTimelineRow,
     SummaryRow,
@@ -160,6 +162,39 @@ def format_summary(rows: list[SummaryRow]) -> str:
     headers = ["category", "segments", "total_airtime"]
     body = [
         [r.category, str(r.segment_count), _format_seconds(r.total_duration_seconds)]
+        for r in rows
+    ]
+    return _render_table(headers, body)
+
+
+def format_songs_added(rows: list[SongsAddedRow]) -> str:
+    headers = ["first_seen_utc", "song_id", "artist", "title", "source", "segments"]
+    body = [
+        [
+            r.first_seen_utc,
+            str(r.song_id),
+            r.artist or "?",
+            r.title or "?",
+            r.source,
+            str(r.segment_count),
+        ]
+        for r in rows
+    ]
+    return _render_table(headers, body)
+
+
+def format_runs(rows: list[RunRow]) -> str:
+    headers = ["id", "run_id", "started_utc", "ended_utc", "events", "duration", "pipeline"]
+    body = [
+        [
+            str(r.capture_run_id),
+            r.run_id,
+            r.started_utc,
+            r.ended_utc or "-",
+            str(r.event_count),
+            _format_seconds(r.duration_seconds),
+            r.pipeline_version,
+        ]
         for r in rows
     ]
     return _render_table(headers, body)
