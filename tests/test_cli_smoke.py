@@ -53,7 +53,23 @@ def test_classify_help_documents_audfprint_min_count() -> None:
     assert proc.returncode == 0, proc.stderr
     assert "--audfprint-min-count" in proc.stdout
     assert "--capture-run-id" in proc.stdout
-    assert "default: 45" in proc.stdout
+    assert "default: 30" in proc.stdout
+
+
+def test_fingerprint_explain_help_lists_options() -> None:
+    proc = _run("fingerprint", "explain", "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "--input" in proc.stdout
+    assert "--expected" in proc.stdout
+    assert "--max-matches" in proc.stdout
+    assert "--min-count" in proc.stdout
+
+
+def test_fingerprint_subcommand_help_lists_explain() -> None:
+    proc = _run("fingerprint", "--help")
+    assert proc.returncode == 0, proc.stderr
+    assert "explain" in proc.stdout
+    assert "candidate score" in proc.stdout
 
 
 def test_capture_chunks_help_lists_chunk_options() -> None:

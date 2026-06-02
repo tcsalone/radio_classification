@@ -61,7 +61,7 @@ def dedupe_commercials(
     dry_run: bool = False,
     transcript_similarity_threshold: float = 0.55,
     adjacent_similarity_threshold: float = 0.35,
-    max_adjacent_gap_seconds: float = 2.0,
+    max_adjacent_gap_seconds: float = 10.0,
     max_adjacent_segment_seconds: float = 30.0,
     max_adjacent_combined_seconds: float = 90.0,
 ) -> CommercialDedupeReport:
@@ -73,6 +73,12 @@ def dedupe_commercials(
     * or adjacent short commercial events for the same canonical brand with at
       least modest transcript overlap, which catches one ad split across
       sequential 10-second classifier windows.
+
+    ``max_adjacent_gap_seconds`` defaults to 10s because the classifier emits
+    ~10s windows and a single 30s ad can land split between window N and
+    window N+1 with a brief silent gap. The transcript-similarity guard
+    (``adjacent_similarity_threshold``) keeps unrelated back-to-back ads
+    from the same brand from being folded together.
     """
     members = _load_members(store)
     if not members:

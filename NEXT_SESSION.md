@@ -163,6 +163,21 @@ So **Tier 3 to Gemini Flash is essentially free** (sub-penny per day). The quest
 
 **Estimated effort:** ~1 focused session for the prevention path, ~half a session for the dedup admin command. Tests for both should follow the patterns we established in `tests/test_songs_discovery.py` and `tests/test_persistence_store.py`.
 
+**Status update 2026-06-01:**
+
+- **Item B (brand canonicalization):** `canonicalize_brand` now applies a
+  generic ``" & "`` → ``" and "`` rule before alias lookup so unmapped
+  advertisers fold automatically; inline ``&`` in brands like ``AT&T``
+  stays intact. Tests added in `tests/test_brands.py`.
+- **Item A (adjacent-split folding):** `dedupe_commercials` now uses a
+  10-second adjacent-gap default (was 2s), so a single ad split across two
+  classifier windows with a brief silent gap folds correctly. Tests added
+  in `tests/test_commercials_dedupe.py`.
+- **Item 2 (admin command):** `radio-classifier commercials dedupe`
+  already exists (`src/radio_classifier/commercials/dedupe.py`).
+- Still open: reducer-level pre-write merge pass (the dedupe runs post-hoc
+  today) and Item C (minhash threshold loosening).
+
 ### 7. New report: chronological song log (`report songs-timeline`)
 
 **The question:** "Show me every song detected in chronological order." Today this requires a hand-written SQLite query — would be useful as a built-in subcommand.
@@ -373,22 +388,24 @@ Three clips remain stubbornly unrecoverable even at the floor:
 
 **Open follow-up (deferred):**
 
-- Consider lowering default `AudfprintConfig.min_count` from 45 to ~20.
-  Based on this eval that doubles recall (0 → 2 /7 at the strict floor,
-  4 /7 at 5). The Temper City / Linkin Park collision happens at 67,
-  well above any candidate threshold, so the change wouldn't surface
-  that as a new false positive. Defer until we run the morning-drive
-  bimodal score check from the original `min_count` history to confirm
-  the false-positive floor still sits at ≤ 49.
+- ~~Consider lowering default `AudfprintConfig.min_count` from 45 to ~20.~~
+  **DONE 2026-06-01.** Lowered to `30` (a compromise between the previous
+  45 floor and the 20 the eval recommended). The Temper City / Linkin Park
+  collision sits at 67, well above either threshold, and the
+  `low_confidence_fingerprint_required_repeats` guard remains the
+  false-positive backstop for scores in [30, 60). Re-run the morning-drive
+  bimodal score check if any new collisions surface in long-running data.
 - Wonderwall second-reference experiment (above).
-- Build a CLI `fingerprint explain <clip> <expected-track>` diagnostic
+- ~~Build a CLI `fingerprint explain <clip> <expected-track>` diagnostic
   that prints the expected reference's score / rank even when another
-  reference wins. (We hand-rolled this with `audfprint match
-  --max-matches 20` this session; deserves to be a first-class tool.)
+  reference wins.~~ **DONE 2026-06-01.** New
+  `radio-classifier fingerprint explain --input CLIP [--expected SUBSTR]`
+  command surfaces every audfprint candidate (default top 20) with rank
+  and score, and explicitly calls out whether ``--expected`` appears.
 
 ## Other items spotted during today's 12h run (lower priority)
 
 - ~~**Julia Wolf "In My Room (Acoustic)" promo-vs-song detection:** 10 "spins" in 7m10s = ~43 sec per spin. That's a station promo, not a real play. Spin definition needs a heuristic to disambiguate (e.g., "if average spin duration < 50% of full track length, suppress as promo").~~ **DONE.** Spin tally now reports `full_spin_count` and `promo_spin_count` side by side (threshold `PROMO_MAX_SPIN_SECONDS = 90s`). `report songs` / `report artists` show `spins   promos` columns, the dashboard renders a `+N promo` pill, and the songs/artists sort order tiebreaks by non-promo airtime so teaser-heavy entries drop down the leaderboard. Julia Wolf went from a top-2 entry to #4 in the morning-DB songs report and out of the top-8 artists report.
 - ~~**LINKIN PARK casing artifact:** artist display name shows ALL CAPS because most Shazam responses returned that way. Either normalize artist casing on write, or pick a different display-winner heuristic.~~ **DONE.** `BroadcastStore.upsert_song` now normalizes the known `LINKIN PARK` display artifact to `Linkin Park`, prefers mixed-case reference data over all-caps Shazam display text for the same song identity, and preserves legitimate acronyms like `AFI`. Existing rows in `data/eval/morning_20260530_24x30m.db` were normalized too.
 - **Modest Mouse "Picking Dragons' Pockets" Shazam-vs-tracklist dedup miss:** showed up as a "new" Shazam discovery despite being on the tracklist. Likely unicode apostrophe difference (U+2019 vs U+0027) or audfprint missing it at min_count=60. Worth a 30-min investigation.
-- ~~**audfprint min_count=60 floor tuning:** might be too strict for some reference tracks. Could revisit per-track score floors or fall back to a lower floor if Shazam confirms.~~ **DONE.** The audfprint candidate floor is now `45`, but scores below the strong `60` threshold require 3 adjacent same-track matches in the funnel before Tier 1 wins. This should recover weaker real matches without reopening the old one-off false-positive pile.
+- ~~**audfprint min_count=60 floor tuning:** might be too strict for some reference tracks. Could revisit per-track score floors or fall back to a lower floor if Shazam confirms.~~ **DONE.** The audfprint candidate floor is now `30` (lowered from 45 on 2026-06-01 after the validated-unknowns eval), and scores below the strong `60` threshold still require 3 adjacent same-track matches in the funnel before Tier 1 wins. This should recover weaker real matches without reopening the old one-off false-positive pile.

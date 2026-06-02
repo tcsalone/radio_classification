@@ -143,6 +143,109 @@ def test_dedupe_commercials_folds_adjacent_split_windows(tmp_path: Path) -> None
         store.close()
 
 
+def test_dedupe_commercials_folds_split_across_classifier_window_gap(tmp_path: Path) -> None:
+    """A single ad split across two ~10s classifier windows must fold.
+
+    Real-world reproduction (from the 2026-05-31 16h run): a 30s Toyota ad
+    landed in window N (10s body, transcript ending ``"...hurry in whi-"``)
+    and window N+1 (20s body, transcript starting ``"in while there's still
+    time to save..."``) with a ~9s wall-clock gap because the classifier
+    emitted them as separate rows. The 2s adjacent-split gap used previously
+    missed it; the new 10s default catches it.
+    """
+    store = BroadcastStore(tmp_path / "commercials.db")
+    try:
+        toyota = store.upsert_brand("Toyota")
+        # The two transcripts share the window-overlap region (5s of audio
+        # appears in both windows) so they retain the same anchor phrase.
+        c1 = store.insert_commercial(
+            brand_id=toyota,
+            duration_bucket_seconds=10,
+            minhash_hex="aa",
+            reference_transcript=(
+                "Toyota Memorial Day offers are extended hurry in while "
+                "there is still time to save"
+            ),
+        )
+        c2 = store.insert_commercial(
+            brand_id=toyota,
+            duration_bucket_seconds=20,
+            minhash_hex="bb",
+            reference_transcript=(
+                "in while there is still time to save on Toyota Camry "
+                "Corolla and electrified models"
+            ),
+        )
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=15)
+        _put_commercial_event(
+            store,
+            start=base,
+            duration=10,
+            brand_id=toyota,
+            brand_name="Toyota",
+            commercial_id=c1,
+        )
+        _put_commercial_event(
+            store,
+            start=base + timedelta(seconds=19),
+            duration=20,
+            brand_id=toyota,
+            brand_name="Toyota",
+            commercial_id=c2,
+        )
+
+        report = dedupe_commercials(store)
+        assert report.collapsed_pairs == 1
+        assert report.rows_deleted == 1
+    finally:
+        store.close()
+
+
+def test_dedupe_commercials_does_not_fold_distant_same_brand_events(tmp_path: Path) -> None:
+    """Two ads for the same brand 60s apart with different transcripts stay
+    separate. Guards against the new 10s adjacent gap silently merging
+    distinct airings of similarly-worded ads.
+    """
+    store = BroadcastStore(tmp_path / "commercials.db")
+    try:
+        brand = store.upsert_brand("Toyota")
+        c1 = store.insert_commercial(
+            brand_id=brand,
+            duration_bucket_seconds=20,
+            minhash_hex="cc",
+            reference_transcript="Test drive a Toyota Tacoma at your local dealer",
+        )
+        c2 = store.insert_commercial(
+            brand_id=brand,
+            duration_bucket_seconds=20,
+            minhash_hex="dd",
+            reference_transcript="Lease a Toyota Camry for two ninety nine a month",
+        )
+        base = datetime.now(tz=timezone.utc) - timedelta(minutes=20)
+        _put_commercial_event(
+            store,
+            start=base,
+            duration=20,
+            brand_id=brand,
+            brand_name="Toyota",
+            commercial_id=c1,
+        )
+        _put_commercial_event(
+            store,
+            start=base + timedelta(seconds=80),
+            duration=20,
+            brand_id=brand,
+            brand_name="Toyota",
+            commercial_id=c2,
+        )
+
+        report = dedupe_commercials(store)
+        assert report.collapsed_pairs == 0
+        assert store.connection.execute("SELECT COUNT(*) FROM commercials").fetchone()[0] == 2
+    finally:
+        store.close()
+
+
 def test_dedupe_commercials_dry_run_is_pure(tmp_path: Path) -> None:
     store = BroadcastStore(tmp_path / "commercials.db")
     try:

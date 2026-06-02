@@ -106,16 +106,22 @@ class AudfprintConfig:
       manually-confirmed real match scored >=84, every confirmed false
       positive scored <=49. Setting the floor at 60 drops the noise pile
       without losing any verified real hit.
-    * 45 — current candidate floor. Borderline matches in the 45-59 range are
+    * 45 — first relaxation. Borderline matches in the 45-59 range are
       allowed out of audfprint so the funnel can recover weak real hits, but
       :class:`FunnelOrchestrator` requires additional adjacent same-track
       confirmation before accepting them.
+    * 30 — current candidate floor. The 2026-05-31 validated-unknowns eval
+      showed real recall going from 0/7 at 45 to 1/7 at 30 (Bad Omens
+      recovered at score 60), with the known Linkin Park / Temper City
+      collision still scoring 67 — well above either threshold. The
+      ``low_confidence_fingerprint_required_repeats`` guard in the funnel
+      remains the false-positive backstop for scores in [30, 60).
 
     Tune via :class:`AudfprintIndex` per deployment if recall degrades on a
     different station / index.
     """
 
-    min_count: int = 45
+    min_count: int = 30
     match_win: int = 2
     density: int = 20
     # NOTE: audfprint's ``rank 0`` is not always the highest-scoring match. A
@@ -215,6 +221,45 @@ class AudfprintIndex:
                 message=f"audfprint index missing: {self.index_path}",
             )
         return self._match_file(wav_path, "")
+
+    def explain(
+        self,
+        wav_path: Path,
+        *,
+        max_matches: int = 20,
+        min_count: int = 1,
+    ) -> list[tuple[str, int]]:
+        """Return every reference candidate ``(track_id, count)`` for one clip.
+
+        Unlike :meth:`match_file` (which returns the best-scoring match), this
+        surfaces the full ranked list so an operator can see whether an
+        expected track shows up at all and at what score. Used by the
+        ``radio-classifier fingerprint explain`` CLI when debugging why a
+        known broadcast clip is being missed.
+
+        ``min_count`` defaults to ``1`` so the diagnostic still surfaces real
+        but very weak candidates that the production funnel would reject.
+        Candidates are returned sorted by descending ``count``.
+        """
+        if not self.exists():
+            return []
+        cmd = list(_audfprint_argv())
+        cmd += [
+            "match",
+            "-d",
+            str(self.index_path),
+            "--min-count",
+            str(int(min_count)),
+            "--match-win",
+            str(self.config.match_win),
+            "--max-matches",
+            str(int(max_matches)),
+            str(wav_path),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            return []
+        return parse_audfprint_candidates(proc.stdout)
 
     def _match_file(self, wav_path: Path, window_start_utc: str) -> FingerprintResult:
         cmd = list(_audfprint_argv())
@@ -341,6 +386,31 @@ def parse_audfprint_match_output(stdout: str, window_start_utc: str) -> Fingerpr
         title=title,
         match_score=float(best_count),
     )
+
+
+def parse_audfprint_candidates(stdout: str) -> list[tuple[str, int]]:
+    """Return every ``(track_id, count)`` candidate emitted by ``audfprint match``.
+
+    Mirrors the parsing logic of :func:`parse_audfprint_match_output` but
+    preserves the full list instead of collapsing to one winner. Results are
+    sorted by descending ``count``; tied counts preserve audfprint's emission
+    order. Empty input or no ``Matched`` lines returns ``[]``.
+    """
+    if not stdout:
+        return []
+    candidates: list[tuple[str, int, int]] = []
+    for emit_index, raw in enumerate(stdout.splitlines()):
+        line = raw.strip()
+        if not line or line.upper().startswith("NOMATCH"):
+            continue
+        m = _MATCH_LINE_RE.search(line)
+        if not m:
+            continue
+        track = m.group("track").strip()
+        count = int(m.group("count"))
+        candidates.append((track, count, emit_index))
+    candidates.sort(key=lambda c: (-c[1], c[2]))
+    return [(track, count) for track, count, _ in candidates]
 
 
 def parse_audfprint_batch_output(

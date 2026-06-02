@@ -7,6 +7,7 @@ Subcommands:
 * ``db migrate-from-live105sux`` — port a live105sux v1 SQLite into the current schema.
 * ``fingerprint index`` — build / extend the audfprint song index.
 * ``fingerprint eval``  — run the recall harness against a truth CSV.
+* ``fingerprint explain`` — show every audfprint candidate score for one clip.
 * ``ingest``         — live RTL-SDR capture through the 3-tier funnel.
 * ``capture chunks`` — continuous RTL-SDR capture into fixed WAV chunks.
 * ``classify``       — offline 3-tier funnel on a WAV file.
@@ -170,10 +171,10 @@ def _add_funnel_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--audfprint-min-count",
         type=int,
-        default=45,
+        default=30,
         help=(
             "Minimum audfprint common-hash count to surface a Tier-1 candidate "
-            "(default: 45; low scores still require extra adjacent confirmation)"
+            "(default: 30; low scores still require extra adjacent confirmation)"
         ),
     )
     p.add_argument(
@@ -359,8 +360,52 @@ def _build_parser() -> argparse.ArgumentParser:
     fp_eval.add_argument(
         "--audfprint-min-count",
         type=int,
-        default=45,
-        help="Minimum audfprint common-hash count for eval candidates (default: 45)",
+        default=30,
+        help="Minimum audfprint common-hash count for eval candidates (default: 30)",
+    )
+
+    fp_explain = fp_sub.add_parser(
+        "explain",
+        help="Run audfprint match on one clip and print every candidate score",
+    )
+    fp_explain.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        required=True,
+        help="WAV clip to match (a captured broadcast snippet, not a reference file)",
+    )
+    fp_explain.add_argument(
+        "--index",
+        type=Path,
+        default=None,
+        help="Index file (default: data/audfprint/songs.pklz)",
+    )
+    fp_explain.add_argument(
+        "--max-matches",
+        type=int,
+        default=20,
+        help="Maximum candidates audfprint should consider (default: 20)",
+    )
+    fp_explain.add_argument(
+        "--min-count",
+        type=int,
+        default=1,
+        help=(
+            "Floor on candidate hash counts (default: 1). The default surfaces "
+            "very weak candidates the production funnel would reject so you "
+            "can compare them against the expected track."
+        ),
+    )
+    fp_explain.add_argument(
+        "--expected",
+        type=str,
+        default=None,
+        help=(
+            "Substring (case-insensitive) of the expected reference name. "
+            "When supplied the report calls out whether that reference "
+            "appeared and at what rank/score."
+        ),
     )
 
     # ---- classify (offline)
@@ -749,6 +794,60 @@ def cmd_fp_eval(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0 if report.recall >= 0.9 else 2
+
+
+def cmd_fp_explain(args: argparse.Namespace) -> int:
+    from radio_classifier.fingerprint import AudfprintConfig, AudfprintIndex
+
+    wav_path: Path = args.input
+    if not wav_path.is_file():
+        print(f"radio-classifier fingerprint explain: not a file: {wav_path}", file=sys.stderr)
+        return 1
+    index_path = args.index or _default_index_path()
+    index = AudfprintIndex(index_path=index_path, config=AudfprintConfig())
+    if not index.exists():
+        print(
+            f"radio-classifier fingerprint explain: index missing: {index_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    candidates = index.explain(
+        wav_path,
+        max_matches=max(1, int(args.max_matches)),
+        min_count=max(1, int(args.min_count)),
+    )
+    print(f"clip:  {wav_path}")
+    print(f"index: {index_path}")
+    if not candidates:
+        print("no candidates returned by audfprint (NOMATCH or empty output)")
+        return 0
+
+    print()
+    print("rank  count  track")
+    print("----  -----  -----")
+    expected_lower = args.expected.lower() if args.expected else None
+    expected_hits: list[tuple[int, int, str]] = []
+    for rank, (track, count) in enumerate(candidates, start=1):
+        marker = ""
+        if expected_lower is not None and expected_lower in track.lower():
+            marker = "  <-- expected"
+            expected_hits.append((rank, count, track))
+        print(f"{rank:>4}  {count:>5}  {track}{marker}")
+
+    if expected_lower is not None:
+        print()
+        if expected_hits:
+            best = expected_hits[0]
+            print(
+                f"expected match found: {best[2]!r} at rank {best[0]}, score {best[1]}"
+            )
+        else:
+            print(
+                f"expected {args.expected!r} NOT among the top {len(candidates)} "
+                f"candidates (try a larger --max-matches or a lower --min-count)"
+            )
+    return 0
 
 
 # -------------------------------------------------- funnel construction
@@ -1979,6 +2078,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_fp_index(args)
             if args.fp_command == "eval":
                 return cmd_fp_eval(args)
+            if args.fp_command == "explain":
+                return cmd_fp_explain(args)
             return 2
         if args.command == "classify":
             return cmd_classify(args)

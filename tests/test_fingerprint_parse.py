@@ -15,18 +15,23 @@ from radio_classifier.fingerprint.audfprint_engine import (
     _default_index_ncores,
     _split_track_id,
     parse_audfprint_batch_output,
+    parse_audfprint_candidates,
     parse_audfprint_match_output,
 )
 from radio_classifier.fingerprint.types import FingerprintStatus
 
 
 def test_default_audfprint_candidate_floor_is_below_strong_acceptance_floor() -> None:
-    """The CLI now surfaces 45-59 score candidates for downstream confirmation.
+    """The CLI surfaces low-score candidates for downstream confirmation.
 
-    They are not accepted directly by the funnel; low-confidence candidates
-    need extra adjacent same-track support before Tier 1 wins.
+    They are not accepted directly by the funnel; scores below the strong
+    acceptance threshold (~60) need extra adjacent same-track support before
+    Tier 1 wins. The 2026-05-31 validated-unknowns eval showed lowering this
+    floor from 45 to 30 recovered Bad Omens (score 60) without surfacing any
+    new false positive from the known Linkin Park / Temper City collision
+    (score 67) which sits above either threshold.
     """
-    assert AudfprintConfig().min_count == 45
+    assert AudfprintConfig().min_count == 30
 
 
 def test_default_index_ncores_honours_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -191,6 +196,29 @@ def test_parse_batch_picks_best_match_per_query(tmp_path) -> None:
     assert results[0].title == "Track"
     assert results[0].match_score == 50.0
     assert results[1].status is FingerprintStatus.no_match
+
+
+def test_parse_audfprint_candidates_returns_all_matches_in_score_order() -> None:
+    """`fingerprint explain` relies on every candidate, not just the winner."""
+    stdout = (
+        "Matched q.wav as Noisy - Reference.webm at 12.0 s "
+        "with 15 of 500 common hashes at rank 0\n"
+        "Matched q.wav as Real - Match.mp3 at 216.0 s "
+        "with 60 of 246 common hashes at rank 1\n"
+        "Matched q.wav as Another - Weak.mp3 at 4.0 s "
+        "with 7 of 120 common hashes at rank 2\n"
+    )
+    candidates = parse_audfprint_candidates(stdout)
+    assert candidates == [
+        ("Real - Match.mp3", 60),
+        ("Noisy - Reference.webm", 15),
+        ("Another - Weak.mp3", 7),
+    ]
+
+
+def test_parse_audfprint_candidates_handles_no_match() -> None:
+    assert parse_audfprint_candidates("") == []
+    assert parse_audfprint_candidates("NOMATCH q.wav\n") == []
 
 
 def test_default_max_matches_is_above_one() -> None:

@@ -7,10 +7,18 @@ import re
 from radio_classifier.segments.normalize import normalize_token
 
 _SPACE_RE = re.compile(r"\s+")
+# ``Smart & Final`` vs ``Smart and Final`` etc. come in interchangeably from the
+# Whisper transcript / LLM-derived brand field. We collapse ``" & "`` (with
+# surrounding whitespace) to ``" and "`` before the alias table is consulted so
+# unmapped advertisers fold automatically. ``AT&T``-style tokens with no
+# surrounding spaces are left alone because the ``&`` there is genuinely part
+# of the brand spelling.
+_AMP_RE = re.compile(r"\s+&\s+")
 
 
 def _clean_brand(name: str) -> str:
-    return _SPACE_RE.sub(" ", name.strip())
+    collapsed = _SPACE_RE.sub(" ", name.strip())
+    return _AMP_RE.sub(" and ", collapsed)
 
 
 _BRAND_ALIASES: dict[str, str] = {
