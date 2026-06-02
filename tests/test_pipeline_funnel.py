@@ -398,6 +398,108 @@ def test_shazam_fallback_used_when_music_and_enabled(tmp_path: Path) -> None:
         store.close()
 
 
+def test_unknown_music_rescue_reclassifies_shazam_miss_with_close_speech() -> None:
+    shazam = SequenceShazam(
+        [
+            ShazamResult(
+                status=ShazamStatus.no_match,
+                window_start_utc="",
+            )
+        ]
+    )
+    orch = FunnelOrchestrator(
+        tier1=FakeTier1(status=FingerprintStatus.no_match),
+        tier2=FakeTier2(
+            label=AcousticLabel.MUSIC,
+            music_prob=0.22,
+            speech_prob=0.08,
+            other_prob=0.70,
+        ),
+        tier3=_tier3(
+            BroadcastCategory.COMMERCIAL,
+            brand="Twisted Tea",
+            transcript="Twisted Tea hard iced tea is available now",
+        ),
+        resolver=None,
+        store=None,
+        shazam_fn=shazam,
+    )
+
+    r = orch.process(_make_window())
+
+    assert r.stage is FunnelStage.tier3_rescue
+    assert r.shazam is not None
+    assert r.shazam.status is ShazamStatus.no_match
+    assert r.speech is not None
+    assert r.segment_input is not None
+    assert r.segment_input.key.category is BroadcastCategory.COMMERCIAL
+    assert r.segment_input.brand_name == "Twisted Tea"
+
+
+def test_unknown_music_rescue_does_not_run_for_pure_music_shazam_miss() -> None:
+    shazam = SequenceShazam(
+        [
+            ShazamResult(
+                status=ShazamStatus.no_match,
+                window_start_utc="",
+            )
+        ]
+    )
+    orch = FunnelOrchestrator(
+        tier1=FakeTier1(status=FingerprintStatus.no_match),
+        tier2=FakeTier2(
+            label=AcousticLabel.MUSIC,
+            music_prob=0.90,
+            speech_prob=0.01,
+            other_prob=0.09,
+        ),
+        tier3=_tier3(BroadcastCategory.COMMERCIAL, brand="Should Not Run"),
+        resolver=None,
+        store=None,
+        shazam_fn=shazam,
+    )
+
+    r = orch.process(_make_window())
+
+    assert r.stage is FunnelStage.tier2_unknown_song
+    assert r.speech is None
+    assert r.segment_input is not None
+    assert r.segment_input.key.category is BroadcastCategory.SONG
+
+
+def test_unknown_music_rescue_keeps_unknown_song_when_tier3_says_song() -> None:
+    shazam = SequenceShazam(
+        [
+            ShazamResult(
+                status=ShazamStatus.no_match,
+                window_start_utc="",
+            )
+        ]
+    )
+    orch = FunnelOrchestrator(
+        tier1=FakeTier1(status=FingerprintStatus.no_match),
+        tier2=FakeTier2(
+            label=AcousticLabel.MUSIC,
+            music_prob=0.22,
+            speech_prob=0.08,
+            other_prob=0.70,
+        ),
+        tier3=_tier3(BroadcastCategory.SONG, transcript="unclear lyrics continue"),
+        resolver=None,
+        store=None,
+        shazam_fn=shazam,
+    )
+
+    r = orch.process(_make_window())
+
+    assert r.stage is FunnelStage.tier2_unknown_song
+    assert r.speech is not None
+    assert r.speech.category is BroadcastCategory.SONG
+    assert r.segment_input is not None
+    assert r.segment_input.key.category is BroadcastCategory.SONG
+    assert r.segment_input.key.song_id is None
+
+
 def test_shazam_fallback_reuses_cached_match_between_rechecks() -> None:
     shazam = SequenceShazam(
         [

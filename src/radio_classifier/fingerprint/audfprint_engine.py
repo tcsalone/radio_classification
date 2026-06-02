@@ -481,6 +481,22 @@ def parse_audfprint_batch_output(
     return results
 
 
+# Tail suffix that marks an alternate reference recording for the same song
+# identity. Lets the operator drop multiple references for a single track
+# into ``data/reference/songs/`` — e.g. ``Oasis - Wonderwall.mp3`` plus
+# ``Oasis - Wonderwall (alt).mp3`` (a remaster or live cut from a different
+# YouTube source) — and have both refs resolve to one ``songs`` row.
+#
+# Matched keywords are deliberately narrow: ``alt``, ``alt 2``, ``ref``,
+# ``ref 2``, ``reference``, ``source``, ``v2`` etc. We do not strip generic
+# parentheticals so legitimate variants like ``Wonderwall (MTV Unplugged)``
+# stay distinguishable from the studio recording.
+_REF_VARIANT_SUFFIX_RE = re.compile(
+    r"\s*\(\s*(?:alt(?:ernate|ernative)?|ref(?:erence)?|source|src|v)\s*\d*\s*\)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _split_track_id(track: str) -> tuple[str | None, str | None]:
     """Heuristic split of an ``audfprint`` track label into (artist, title).
 
@@ -490,6 +506,13 @@ def _split_track_id(track: str) -> tuple[str | None, str | None]:
     * ``"Artist_-_Title.wav"`` (underscored — some audfprint builds) → ``("Artist", "Title")``.
     * ``"Title.wav"`` → ``(None, "Title")``.
     * Path-like strings → take basename then strip extension.
+    * Trailing alternate-reference markers (``(alt)``, ``(alt 2)``, ``(ref)``,
+      ``(reference)``, ``(source)``, ``(v2)``, …) are stripped so multiple
+      reference recordings for the same song share one identity. The check
+      runs **after** path/extension stripping so a filename like
+      ``Oasis - Wonderwall (alt 2).mp3`` produces ``("Oasis", "Wonderwall")``.
+      Genuinely-different variants such as ``Wonderwall (MTV Unplugged)`` are
+      left intact — only narrow operator-supplied disambiguators are folded.
     """
     raw = track
     if "/" in raw or "\\" in raw:
@@ -501,5 +524,7 @@ def _split_track_id(track: str) -> tuple[str | None, str | None]:
     for sep in (" - ", "_-_"):
         if sep in raw:
             artist, title = raw.split(sep, 1)
-            return artist.strip() or None, title.strip() or None
-    return None, raw.strip() or None
+            title = _REF_VARIANT_SUFFIX_RE.sub("", title).strip()
+            return artist.strip() or None, title or None
+    raw = _REF_VARIANT_SUFFIX_RE.sub("", raw).strip()
+    return None, raw or None

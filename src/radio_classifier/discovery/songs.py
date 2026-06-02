@@ -23,7 +23,11 @@ from pathlib import Path
 import re
 from typing import Iterator
 
-from radio_classifier.persistence.broadcast_store import BroadcastStore
+from radio_classifier.persistence.broadcast_store import (
+    BroadcastStore,
+    _display_key,
+    _prefer_display_value,
+)
 from radio_classifier.segments.normalize import normalize_token
 
 
@@ -356,25 +360,34 @@ def _norm(value: str | None) -> str | None:
     while our curated tracklist stores simpler titles. For "already indexed?"
     checks those should compare equal, so ``Who's`` == ``who’s`` and
     ``Go Away (feat. Best Coast)`` == ``Go Away``.
+
+    Feature suffixes are stripped here and not in ``_display_key``: the
+    broadcast store's identity matching deliberately treats ``Go Away`` and
+    ``Go Away (feat. Best Coast)`` as the same song only at the tracklist
+    layer, not in the broadcast event store.
     """
     if not value:
         return None
-    cleaned = value.replace("’", "'").replace("‘", "'")
-    cleaned = _FEATURE_SUFFIX_RE.sub("", cleaned)
-    return normalize_token(cleaned)
+    cleaned = _FEATURE_SUFFIX_RE.sub("", value)
+    key = _display_key(cleaned)
+    if not key:
+        return None
+    return normalize_token(key)
 
 
 def _normalize_dedupe_key(artist: str | None, title: str | None) -> tuple[str, str]:
-    """Same casefold-and-trim rule used by ``BroadcastStore.upsert_song``.
+    """Same identity rule used by ``BroadcastStore.upsert_song``.
+
+    Delegates to :func:`broadcast_store._display_key` so dedupe folds the
+    same set of songs the upsert path would have collapsed if it had seen
+    them in a single pass (typographic-vs-ASCII apostrophes, filename
+    underscore artifacts, casing/whitespace drift).
 
     Returning a 2-tuple of strings (not Optional) lets the caller use the
     value directly as a dict key without worrying about Nones — empty
     strings are still distinguishable from real content.
     """
-    return (
-        (artist or "").strip().casefold(),
-        (title or "").strip().casefold(),
-    )
+    return (_display_key(artist), _display_key(title))
 
 
 def _iter_dedupe_groups(store: BroadcastStore) -> Iterator[DedupeGroup]:
@@ -443,7 +456,13 @@ def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeRepor
         losers had one, copy it over. (Belt-and-braces — the survivor-pick
         usually already satisfies this, but we double-check so the dedupe
         is idempotent and order-of-operations-safe.)
-    3.  Delete the loser ``songs`` rows.
+    3.  Upgrade the survivor's displayed artist/title to the cleanest variant
+        in the group. Audfprint reference filenames sanitize ``'`` to ``_``
+        and that artifact propagates into ``songs.title``; if a Shazam or
+        curated row in the same group carries a cleaner spelling we adopt
+        it for display while keeping the audfprint identity (track id,
+        source) intact.
+    4.  Delete the loser ``songs`` rows.
 
     Pass ``dry_run=True`` to compute and return the report without writing.
     """
@@ -458,11 +477,16 @@ def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeRepor
                 survivor = group.survivor
                 loser_ids = [m.song_id for m in group.losers]
                 placeholders = ",".join("?" * len(loser_ids))
+                best_artist = survivor.artist
+                best_title = survivor.title
+                for loser in group.losers:
+                    best_artist = _prefer_display_value(best_artist, loser.artist)
+                    best_title = _prefer_display_value(best_title, loser.title)
                 cur = conn.execute(
                     f"UPDATE broadcast_events SET song_id = ?, artist = COALESCE(artist, ?), "
                     f"track_title = COALESCE(track_title, ?) "
                     f"WHERE song_id IN ({placeholders})",
-                    [survivor.song_id, survivor.artist, survivor.title, *loser_ids],
+                    [survivor.song_id, best_artist, best_title, *loser_ids],
                 )
                 repointed += cur.rowcount or 0
                 if survivor.audfprint_track_id is None:
@@ -475,6 +499,11 @@ def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeRepor
                             "UPDATE songs SET audfprint_track_id = ?, source = ? WHERE id = ?",
                             (rescue.audfprint_track_id, "audfprint", survivor.song_id),
                         )
+                if best_artist != survivor.artist or best_title != survivor.title:
+                    conn.execute(
+                        "UPDATE songs SET artist = ?, title = ? WHERE id = ?",
+                        (best_artist, best_title, survivor.song_id),
+                    )
                 cur = conn.execute(
                     f"DELETE FROM songs WHERE id IN ({placeholders})",
                     loser_ids,

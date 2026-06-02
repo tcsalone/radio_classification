@@ -17,7 +17,13 @@ from pathlib import Path
 from radio_classifier.seeding.scrape import Track
 
 
-_SAFE = re.compile(r"[^A-Za-z0-9._\- ]+")
+# Characters allowed in reference audio filenames. Apostrophes are kept now
+# (they are valid on every filesystem we target) so the audfprint track_id
+# parser surfaces titles like ``Adam's Song`` instead of ``Adam_s Song``.
+# Without this, the underscore propagates into ``songs.title`` and collides
+# with Shazam's apostrophe form in deduplication — see the 2026-06-01
+# Modest Mouse "Picking Dragons' Pockets" dedup miss.
+_SAFE = re.compile(r"[^A-Za-z0-9._\-' ]+")
 
 # Any of these extensions on disk for a track's stem means we already have
 # usable reference audio and should not re-invoke yt-dlp. This deliberately
@@ -33,9 +39,22 @@ _AUDIO_EXTENSIONS: frozenset[str] = frozenset(
 _NO_TRANSCODE_FORMATS: frozenset[str] = frozenset({"", "best", "bestaudio", "native"})
 
 
+_TYPOGRAPHIC_APOSTROPHES = "\u2018\u2019\u02BC\u201B"
+
+
 def safe_filename_stem(track: Track) -> str:
-    """Build a sanitized filename stem like ``Artist - Title``."""
+    """Build a sanitized filename stem like ``Artist - Title``.
+
+    Typographic apostrophes (``’``, ``‘``, ``ʼ``, ``’``) are folded to ASCII
+    ``'`` before the safe-char filter runs, so the stem stays consistent
+    with the apostrophe form used by the tracklist file and the runtime
+    ``upsert_song`` matcher. Without this normalization a Shazam-delivered
+    title like ``Picking Dragons’ Pockets`` would become a different stem
+    than the curated ``Picking Dragons' Pockets`` line.
+    """
     raw = f"{track.artist} - {track.title}"
+    for ch in _TYPOGRAPHIC_APOSTROPHES:
+        raw = raw.replace(ch, "'")
     return _SAFE.sub("_", raw).strip("_ ")
 
 

@@ -45,6 +45,7 @@ class FunnelStage(str, Enum):
     tier2_unknown_song = "tier2_unknown_song"
     shazam_fallback = "shazam_fallback"
     tier3_speech = "tier3_speech"
+    tier3_rescue = "tier3_rescue"
     skipped = "skipped"
 
 
@@ -104,6 +105,7 @@ class FunnelOrchestrator:
     fingerprint_strong_score_threshold: float = 60.0
     low_confidence_fingerprint_required_repeats: int = 3
     shazam_recheck_windows: int = 4
+    unknown_music_rescue_speech_margin: float = 0.15
     _fingerprint_run_track_id: str | None = field(default=None, init=False, repr=False)
     _fingerprint_run_length: int = field(default=0, init=False, repr=False)
     _unknown_music_window_count: int = field(default=0, init=False, repr=False)
@@ -168,6 +170,24 @@ class FunnelOrchestrator:
                         acoustic=ac,
                         shazam=sz,
                     )
+            if self._should_rescue_unknown_music(ac, sz):
+                assert self.tier3 is not None
+                sp = self.tier3(window)
+                if sp.status is SpeechPipelineStatus.ok and sp.category is not None:
+                    if sp.category is not BroadcastCategory.SONG:
+                        return self._speech_result_to_funnel_result(
+                            window,
+                            stage=FunnelStage.tier3_rescue,
+                            fp=fp,
+                            ac=ac,
+                            sp=sp,
+                            shazam=sz,
+                        )
+                    rescue_speech = sp
+                else:
+                    rescue_speech = sp
+            else:
+                rescue_speech = None
             seg = segment_input_for_unknown_song(
                 window_start_utc=window.window_start_utc,
                 confidence=ac.music_prob if ac else None,
@@ -178,6 +198,7 @@ class FunnelOrchestrator:
                 segment_input=seg,
                 fingerprint=fp,
                 acoustic=ac,
+                speech=rescue_speech,
                 shazam=sz,
             )
 
@@ -208,41 +229,13 @@ class FunnelOrchestrator:
                 speech=sp,
             )
 
-        commercial_resolution: CommercialResolution | None = None
-        commercial_id: int | None = None
-        if sp.category is BroadcastCategory.COMMERCIAL and self.resolver is not None:
-            commercial_resolution = self.resolver.resolve(
-                brand=sp.brand,
-                transcript=sp.transcript,
-                duration_seconds=self.window_seconds,
-                signature=sp.commercial_signature,
-            )
-            commercial_id = commercial_resolution.commercial_id
-
-        if sp.category is BroadcastCategory.SONG:
-            seg = segment_input_for_unknown_song(
-                window_start_utc=window.window_start_utc,
-                confidence=sp.confidence,
-            )
-        else:
-            seg = segment_input_for_speech(
-                window_start_utc=window.window_start_utc,
-                category=sp.category,
-                brand=sp.brand,
-                commercial_id=commercial_id,
-                transcript_excerpt=sp.transcript[:512] if sp.transcript else None,
-                confidence=sp.confidence,
-            )
-
-        return FunnelResult(
-            window_start_utc=window.window_start_utc,
+        return self._speech_result_to_funnel_result(
+            window,
             stage=FunnelStage.tier3_speech,
-            segment_input=seg,
-            fingerprint=fp,
-            acoustic=ac,
-            speech=sp,
-            commercial_resolution=commercial_resolution,
-            brand_mentions=list(sp.brand_mentions) if sp.brand_mentions else None,
+            fp=fp,
+            ac=ac,
+            sp=sp,
+            shazam=None,
         )
 
     # -------------------------------------------------------------- internals
@@ -286,6 +279,79 @@ class FunnelOrchestrator:
     def _reset_unknown_music_run(self) -> None:
         self._unknown_music_window_count = 0
         self._cached_shazam = None
+
+    def _should_rescue_unknown_music(
+        self,
+        ac: AcousticResult | None,
+        sz: ShazamResult | None,
+    ) -> bool:
+        """After Shazam misses, reconsider borderline MUSIC windows as speech.
+
+        This deliberately does not run when Shazam is disabled or errors. The
+        rescue path is for windows that have already failed both local
+        fingerprinting and positive Shazam identification, and only when YAMNet
+        was close enough to speech to justify the extra Whisper/LLM call.
+        """
+
+        return (
+            self.tier3 is not None
+            and ac is not None
+            and ac.label is AcousticLabel.MUSIC
+            and sz is not None
+            and sz.status is ShazamStatus.no_match
+            and self.unknown_music_rescue_speech_margin > 0
+            and (ac.music_prob - ac.speech_prob)
+            <= self.unknown_music_rescue_speech_margin
+        )
+
+    def _speech_result_to_funnel_result(
+        self,
+        window: AudioWindow,
+        *,
+        stage: FunnelStage,
+        fp: FingerprintResult | None,
+        ac: AcousticResult | None,
+        sp: SpeechPipelineResult,
+        shazam: ShazamResult | None,
+    ) -> FunnelResult:
+        commercial_resolution: CommercialResolution | None = None
+        commercial_id: int | None = None
+        if sp.category is BroadcastCategory.COMMERCIAL and self.resolver is not None:
+            commercial_resolution = self.resolver.resolve(
+                brand=sp.brand,
+                transcript=sp.transcript,
+                duration_seconds=self.window_seconds,
+                signature=sp.commercial_signature,
+            )
+            commercial_id = commercial_resolution.commercial_id
+
+        if sp.category is BroadcastCategory.SONG:
+            seg = segment_input_for_unknown_song(
+                window_start_utc=window.window_start_utc,
+                confidence=sp.confidence,
+            )
+        else:
+            assert sp.category is not None
+            seg = segment_input_for_speech(
+                window_start_utc=window.window_start_utc,
+                category=sp.category,
+                brand=sp.brand,
+                commercial_id=commercial_id,
+                transcript_excerpt=sp.transcript[:512] if sp.transcript else None,
+                confidence=sp.confidence,
+            )
+
+        return FunnelResult(
+            window_start_utc=window.window_start_utc,
+            stage=stage,
+            segment_input=seg,
+            fingerprint=fp,
+            acoustic=ac,
+            speech=sp,
+            shazam=shazam,
+            commercial_resolution=commercial_resolution,
+            brand_mentions=list(sp.brand_mentions) if sp.brand_mentions else None,
+        )
 
     def _suppress_singleton_fingerprint_match(self, fp: FingerprintResult) -> FingerprintResult:
         """Demote isolated Tier-1 song hits that lack adjacent support.

@@ -208,6 +208,16 @@ def _add_funnel_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--unknown-music-rescue-speech-margin",
+        type=float,
+        default=0.15,
+        help=(
+            "After audfprint and Shazam both miss, run Tier 3 rescue only when "
+            "YAMNet MUSIC is within this margin of SPEECH (default: 0.15; "
+            "use 0 to disable)"
+        ),
+    )
+    p.add_argument(
         "--whisper-model",
         type=str,
         default="medium.en",
@@ -963,6 +973,10 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
         shazam_fn=shazam_fn,
         window_seconds=args.window_seconds,
         shazam_recheck_windows=max(1, args.shazam_recheck_windows),
+        unknown_music_rescue_speech_margin=max(
+            0.0,
+            args.unknown_music_rescue_speech_margin,
+        ),
     )
 
     return FunnelBundle(

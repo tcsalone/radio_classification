@@ -8,8 +8,17 @@ heard before?" purely from text:
 2. Bucket the segment's duration to the nearest 5 seconds.
 3. Build a MinHash over ``key_phrases`` ∪ word-3-shingles(transcript).
 4. Query ``commercials`` for ``(brand_id, duration_bucket_seconds)`` candidates;
-   pick a match if MinHash Jaccard ≥ 0.70, OR (Jaccard ≥ 0.55 AND transcript
-   word-cosine ≥ 0.85).
+   pick a match if any of:
+
+   * MinHash Jaccard ≥ ``jaccard_primary`` (default 0.70), or
+   * MinHash Jaccard ≥ ``jaccard_secondary`` AND token cosine ≥
+     ``cosine_secondary`` (default 0.55 / 0.85), or
+   * Token cosine ≥ ``cosine_tertiary`` (default 0.85) even when shingle
+     Jaccard is low. Two ASR passes of the same ad often share most words
+     but reorder phrases, which collapses 3-shingle Jaccard while leaving
+     token cosine high. The brand+duration_bucket candidate gate bounds the
+     false-positive risk.
+
 5. If no match, insert a fresh ``commercials`` row.
 
 Steps 3–4 use the deterministic ``datasketch`` MinHash so unit tests can pin
@@ -36,6 +45,11 @@ _MAX_SEGMENT_SECONDS = 90.0
 _DEFAULT_JACCARD_PRIMARY = 0.70
 _DEFAULT_JACCARD_SECONDARY = 0.55
 _DEFAULT_COSINE_SECONDARY = 0.85
+# Tertiary fallback: when MinHash Jaccard is low because phrases were
+# reordered between ASR passes but the same words appear, accept on token
+# cosine alone. The brand_id + duration_bucket candidate gate keeps this
+# from merging unrelated ads.
+_DEFAULT_COSINE_TERTIARY = 0.85
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9']+")
@@ -120,6 +134,7 @@ class CommercialResolverConfig:
     jaccard_primary: float = _DEFAULT_JACCARD_PRIMARY
     jaccard_secondary: float = _DEFAULT_JACCARD_SECONDARY
     cosine_secondary: float = _DEFAULT_COSINE_SECONDARY
+    cosine_tertiary: float = _DEFAULT_COSINE_TERTIARY
     bucket_seconds: int = _BUCKET_SECONDS
     min_segment_seconds: float = _MIN_SEGMENT_SECONDS
     max_segment_seconds: float = _MAX_SEGMENT_SECONDS
@@ -205,9 +220,22 @@ class CommercialIdentityResolver:
                     was_new=False,
                     reason="matched",
                 )
+            cosine: float | None = None
             if jaccard >= cfg.jaccard_secondary:
                 cosine = _cosine_similarity_words(tokens, _tokenize(cand_transcript))
                 if cosine >= cfg.cosine_secondary:
+                    self.store.increment_commercial_play_count(c_id)
+                    return CommercialResolution(
+                        commercial_id=c_id,
+                        brand_id=brand_id,
+                        duration_bucket_seconds=bucket,
+                        was_new=False,
+                        reason="matched",
+                    )
+            if cfg.cosine_tertiary > 0:
+                if cosine is None:
+                    cosine = _cosine_similarity_words(tokens, _tokenize(cand_transcript))
+                if cosine >= cfg.cosine_tertiary:
                     self.store.increment_commercial_play_count(c_id)
                     return CommercialResolution(
                         commercial_id=c_id,

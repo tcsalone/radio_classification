@@ -35,6 +35,28 @@ def test_safe_filename_stem_strips_disallowed_chars() -> None:
     assert stem.startswith("AC")
 
 
+def test_safe_filename_stem_preserves_apostrophes() -> None:
+    """ASCII apostrophes are kept in filenames so the audfprint track_id parser
+    surfaces clean titles. Replacing ``'`` with ``_`` is what produced rows
+    like ``Adam_s Song`` and ``Picking Dragons_ Pockets`` that collided with
+    Shazam's apostrophe form in the songs dedupe pass."""
+    stem = safe_filename_stem(
+        Track(artist="Modest Mouse", title="Picking Dragons' Pockets")
+    )
+    assert stem == "Modest Mouse - Picking Dragons' Pockets"
+    assert "_" not in stem
+
+
+def test_safe_filename_stem_normalises_typographic_apostrophe_to_ascii() -> None:
+    """Shazam-delivered curly apostrophes are normalised so the filename
+    matches the ASCII apostrophe form we use everywhere else (tracklist,
+    runtime ``upsert_song``, display rendering)."""
+    stem = safe_filename_stem(
+        Track(artist="Modest Mouse", title="Picking Dragons\u2019 Pockets")
+    )
+    assert stem == "Modest Mouse - Picking Dragons' Pockets"
+
+
 # -------------------------------------------------------- existing_audio_for_stem
 def test_existing_audio_finds_mp3(tmp_path: Path) -> None:
     target = tmp_path / "Coldplay - Clocks.mp3"

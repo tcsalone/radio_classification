@@ -263,6 +263,51 @@ def test_split_track_id_handles_extensions_and_paths() -> None:
     assert _split_track_id("weird name") == (None, "weird name")
 
 
+def test_split_track_id_collapses_alternate_reference_suffix() -> None:
+    """Multiple reference recordings for the same song must share an identity.
+
+    Lets the operator drop a second Wonderwall reference (e.g. the original
+    1995 master alongside the 2024 stereo remaster we already have) into
+    ``data/reference/songs/`` and have both audfprint matches resolve to
+    the same ``songs.id`` after upsert.
+    """
+    assert _split_track_id("Oasis - Wonderwall (alt).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (alt 2).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (alternate).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (ref).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (ref 2).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (reference).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (source).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id("Oasis - Wonderwall (v2).mp3") == ("Oasis", "Wonderwall")
+    assert _split_track_id(
+        "data/reference/songs/Oasis - Wonderwall (alt).mp3"
+    ) == ("Oasis", "Wonderwall")
+
+
+def test_split_track_id_preserves_genuine_parenthetical_variants() -> None:
+    """We only strip narrow operator-supplied disambiguators.
+
+    Legitimate variants — live cuts, remixes, acoustic versions, feature
+    credits — must stay distinguishable so they remain separate songs.
+    """
+    assert _split_track_id("Oasis - Wonderwall (MTV Unplugged).mp3") == (
+        "Oasis",
+        "Wonderwall (MTV Unplugged)",
+    )
+    assert _split_track_id("Julia Wolf - In My Room (Acoustic).mp3") == (
+        "Julia Wolf",
+        "In My Room (Acoustic)",
+    )
+    assert _split_track_id("Weezer - Go Away (feat. Best Coast).mp3") == (
+        "Weezer",
+        "Go Away (feat. Best Coast)",
+    )
+    assert _split_track_id("Linkin Park - Crawling (Reanimation).mp3") == (
+        "Linkin Park",
+        "Crawling (Reanimation)",
+    )
+
+
 def test_audfprint_argv_expands_tilde_and_envvars(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -154,8 +154,10 @@ So **Tier 3 to Gemini Flash is essentially free** (sub-penny per day). The quest
 - **Fix vector:** extend `canonicalize_brand` to handle: `&` → `and`, strip trailing parent-qualifier phrases (` and Showroom`, ` Insurance`, ` Mobile` if parent is also seen), case-fold all comparisons, add a Whisper-mishearing alias table for the common Live 105 advertisers.
 
 **C. `commercials` row aggregation isn't matching minhashes well.** Even with same brand + same airing time, two rows get created instead of incrementing `play_count` on one row.
-- Need to revisit the minhash-similarity threshold in the upsert path. Currently it appears to be too strict (or comparing wrong fields).
-- May benefit from a secondary signature: brand_id + duration_bucket + a fuzzy transcript-token overlap, used as a fallback when minhash doesn't quite match.
+- ~~Need to revisit the minhash-similarity threshold in the upsert path. Currently it appears to be too strict (or comparing wrong fields).~~
+- ~~May benefit from a secondary signature: brand_id + duration_bucket + a fuzzy transcript-token overlap, used as a fallback when minhash doesn't quite match.~~
+
+**Status update 2026-06-01:** ~~`CommercialIdentityResolver`~~ now has a tertiary cosine-only fallback (`cosine_tertiary = 0.85`) that fires after the primary (Jaccard ≥ 0.70) and secondary (Jaccard ≥ 0.55 + cosine ≥ 0.85) paths. The new path catches the common failure mode where two ASR passes of the same ad share most tokens but reorder phrases (e.g., `Camry and Corolla` ↔ `Corolla and Camry`) — that reordering collapses 3-shingle Jaccard to near zero while leaving raw-token cosine high. Because the matcher is still gated by exact `(brand_id, duration_bucket_seconds)`, the false-merge risk is bounded; the regression suite adds a "different ad copy, same brand+duration must stay separate" case to lock this in. Three new tests in `tests/test_commercials_identity.py`: tertiary match on reordered phrases, no-merge on genuinely different ads of the same brand, and a kill-switch test (`cosine_tertiary=0.0` reverts to the legacy two-path behaviour).
 
 **Two-part deliverable when we work this:**
 1. **Pre-write fix (prevents future duplicates):** ad-merge pass in reducer + tighter `canonicalize_brand` + looser minhash dedup threshold in upsert.
@@ -175,8 +177,12 @@ So **Tier 3 to Gemini Flash is essentially free** (sub-penny per day). The quest
   in `tests/test_commercials_dedupe.py`.
 - **Item 2 (admin command):** `radio-classifier commercials dedupe`
   already exists (`src/radio_classifier/commercials/dedupe.py`).
-- Still open: reducer-level pre-write merge pass (the dedupe runs post-hoc
-  today) and Item C (minhash threshold loosening).
+- ~~Still open: reducer-level pre-write merge pass (the dedupe runs post-hoc
+  today) and Item C (minhash threshold loosening).~~ **Both shipped 2026-06-01.**
+  Reducer-level pre-write merge is in `SegmentReducer.feed()` (merges adjacent
+  commercials by brand + transcript similarity + combined-duration cap before
+  emitting transitions). Item C minhash loosening is the tertiary cosine
+  fallback documented above.
 
 ### 7. New report: chronological song log (`report songs-timeline`)
 
@@ -255,6 +261,14 @@ windows long, well above any "fragment too short to fingerprint" excuse.
   Paper Planes). If any are sub-128k opus, force a transcode for those.
 
 ### 9. Tier 2 misclassifications: commercials/PSAs with music beds bypass YAMNet
+
+**Status:** DONE 2026-06-01 with the conservative rescue-path approach. The
+funnel now keeps the global MUSIC gate unchanged, but when audfprint misses,
+Shazam is enabled and returns `no_match`, and YAMNet's MUSIC score is within
+0.15 of SPEECH, it runs Tier 3 as a `tier3_rescue` attempt. Non-SONG Tier 3
+classifications are persisted as speech-derived events; Tier 3 `SONG`,
+errors, low-confidence Shazam, Shazam disabled, and pure-music windows remain
+`tier2_unknown_song`.
 
 **The question:** Three of the "unknown SONG" segments from the 16h run were
 actually non-music content that YAMNet labeled as MUSIC, so they flowed into
@@ -374,6 +388,44 @@ Three clips remain stubbornly unrecoverable even at the floor:
   high-frequency landmarks audfprint depends on. **Action:** try adding
   a second Wonderwall reference from a different YouTube source (e.g.
   the original 1995 master rather than the 2024 stereo remaster).
+  **Enabler shipped 2026-06-01.** ``_split_track_id`` now strips
+  alternate-reference markers (``(alt)``, ``(alt 2)``, ``(ref)``,
+  ``(reference)``, ``(source)``, ``(v2)``, …) from titles so multiple
+  reference recordings for the same song collapse onto one identity at
+  upsert time. Workflow once an alternate source is identified:
+
+  ```bash
+  # 1. Manually download the alternate from a known URL (NOT a search
+  #    template — controlled selection is the whole point of the
+  #    experiment). Drop into the canonical reference directory with the
+  #    (alt) suffix so the audfprint title parser recognises it.
+  python -m yt_dlp -x --audio-format mp3 --audio-quality 192 \
+    -o "data/reference/songs/Oasis - Wonderwall (alt).%(ext)s" \
+    "<ALT_YT_URL>"
+
+  # 2. Extend the audfprint index with just the new file.
+  RADIO_CLASSIFIER_AUDFPRINT_INDEX_NCORES=1 \
+    .venv/bin/radio-classifier fingerprint index \
+      --dir data/reference/songs/ --extend \
+      --glob "Oasis - Wonderwall (alt).mp3"
+
+  # 3. Sanity-check both references self-match at high score.
+  .venv/bin/radio-classifier fingerprint explain \
+    -i "data/reference/songs/Oasis - Wonderwall.mp3"        --expected Wonderwall
+  .venv/bin/radio-classifier fingerprint explain \
+    -i "data/reference/songs/Oasis - Wonderwall (alt).mp3"  --expected Wonderwall
+
+  # 4. Re-run the morning-capture block that previously had zero hash
+  #    overlap and confirm at least one reference matches.
+  .venv/bin/radio-classifier fingerprint explain \
+    -i "<the block-21 wav>" --expected Wonderwall
+  ```
+
+  Diagnostic confirmed in this session: existing ``Oasis - Wonderwall.mp3``
+  self-matches at count 6395 (rank 1), and the next 11 hash buckets are
+  the same reference. So the reference file itself is fine — the audfprint
+  miss is purely a mix-variance / FM-degradation issue, which is exactly
+  what a second reference should mitigate.
 - **M.I.A. Paper Planes (block 14):** best real score is 4. Genuine
   weak signal — clip likely contains heavy DJ talk or song bookends.
   Re-clipping a cleaner 30 s window from the body of the song may
@@ -395,7 +447,11 @@ Three clips remain stubbornly unrecoverable even at the floor:
   `low_confidence_fingerprint_required_repeats` guard remains the
   false-positive backstop for scores in [30, 60). Re-run the morning-drive
   bimodal score check if any new collisions surface in long-running data.
-- Wonderwall second-reference experiment (above).
+- Wonderwall second-reference experiment (above). **Code enabler shipped
+  2026-06-01** — alt-reference suffix parsing in ``_split_track_id``. The
+  remaining step (download a specific alternate-source URL, extend the
+  index, verify recall on the previously-zero-overlap block) needs an
+  operator with network access and a chosen alternate source URL.
 - ~~Build a CLI `fingerprint explain <clip> <expected-track>` diagnostic
   that prints the expected reference's score / rank even when another
   reference wins.~~ **DONE 2026-06-01.** New
@@ -407,5 +463,5 @@ Three clips remain stubbornly unrecoverable even at the floor:
 
 - ~~**Julia Wolf "In My Room (Acoustic)" promo-vs-song detection:** 10 "spins" in 7m10s = ~43 sec per spin. That's a station promo, not a real play. Spin definition needs a heuristic to disambiguate (e.g., "if average spin duration < 50% of full track length, suppress as promo").~~ **DONE.** Spin tally now reports `full_spin_count` and `promo_spin_count` side by side (threshold `PROMO_MAX_SPIN_SECONDS = 90s`). `report songs` / `report artists` show `spins   promos` columns, the dashboard renders a `+N promo` pill, and the songs/artists sort order tiebreaks by non-promo airtime so teaser-heavy entries drop down the leaderboard. Julia Wolf went from a top-2 entry to #4 in the morning-DB songs report and out of the top-8 artists report.
 - ~~**LINKIN PARK casing artifact:** artist display name shows ALL CAPS because most Shazam responses returned that way. Either normalize artist casing on write, or pick a different display-winner heuristic.~~ **DONE.** `BroadcastStore.upsert_song` now normalizes the known `LINKIN PARK` display artifact to `Linkin Park`, prefers mixed-case reference data over all-caps Shazam display text for the same song identity, and preserves legitimate acronyms like `AFI`. Existing rows in `data/eval/morning_20260530_24x30m.db` were normalized too.
-- **Modest Mouse "Picking Dragons' Pockets" Shazam-vs-tracklist dedup miss:** showed up as a "new" Shazam discovery despite being on the tracklist. Likely unicode apostrophe difference (U+2019 vs U+0027) or audfprint missing it at min_count=60. Worth a 30-min investigation.
+- ~~**Modest Mouse "Picking Dragons' Pockets" Shazam-vs-tracklist dedup miss:** showed up as a "new" Shazam discovery despite being on the tracklist. Likely unicode apostrophe difference (U+2019 vs U+0027) or audfprint missing it at min_count=60. Worth a 30-min investigation.~~ **DONE (2026-06-01).** Root cause was two-sided: Shazam returned the typographic apostrophe (U+2019) while audfprint registered the reference recording with the filename-sanitizer underscore (`Picking Dragons_ Pockets.mp3` → title `Picking Dragons_ Pockets`). Three coordinated fixes: (1) `_display_key` now folds typographic apostrophes → ASCII and drops both `'` and `_` so all three variants collapse onto one identity; (2) `_prefer_display_value` ranks titles by punctuation quality (ASCII apostrophe > typographic > none > underscore artifact), and dedupe upgrades the survivor's display text in the same pass; (3) `safe_filename_stem` keeps apostrophes (instead of replacing with `_`) and pre-normalizes typographic → ASCII so new downloads never reintroduce the artifact. Running `dedupe_songs` on `data/store/broadcast.db` folded **10 duplicate pairs** (Modest Mouse, Staind, Royel Otis, Linkin Park, Blink-182, Cage The Elephant, Red Hot Chili Peppers, Sublime, Almost Monday, Dexter and The Moonrocks), repointing 43 broadcast events. 20 audfprint-only rows still show legacy underscores (no Shazam loser ever existed to upgrade them); these will only resolve when Shazam confirms the same song, or via a one-off operator backfill that reads titles from `tracklist.txt`. 9 new regression tests cover the identity collapse, display upgrade, promote-already-in-tracklist with underscore, and the safe_filename_stem behavior. Commercials Dedupe Item C (loosen minhash threshold) shipped in the same chat as part of this work — new tertiary token-cosine path catches same-ad reorderings that 3-shingle Jaccard misses.
 - ~~**audfprint min_count=60 floor tuning:** might be too strict for some reference tracks. Could revisit per-track score floors or fall back to a lower floor if Shazam confirms.~~ **DONE.** The audfprint candidate floor is now `30` (lowered from 45 on 2026-06-01 after the validated-unknowns eval), and scores below the strong `60` threshold still require 3 adjacent same-track matches in the funnel before Tier 1 wins. This should recover weaker real matches without reopening the old one-off false-positive pile.

@@ -106,6 +106,113 @@ def _dj(seconds: int) -> SegmentInput:
     )
 
 
+def _commercial(
+    seconds: int,
+    *,
+    brand: str = "Toyota",
+    commercial_id: int | None = 1,
+    transcript: str = "Toyota Memorial Day offers are extended on Camry and Corolla",
+) -> SegmentInput:
+    return SegmentInput(
+        _ts(seconds),
+        SegmentKey(
+            BroadcastCategory.COMMERCIAL,
+            brand_key=brand.casefold(),
+            commercial_id=commercial_id,
+        ),
+        brand_name=brand,
+        transcript_excerpt=transcript,
+        confidence=0.88,
+    )
+
+
+def test_adjacent_commercial_windows_same_brand_similar_transcript_merge_before_emit() -> None:
+    r = SegmentReducer()
+    out = []
+    out.extend(
+        r.feed(
+            _commercial(
+                0,
+                commercial_id=11,
+                transcript="Toyota Memorial Day offers are extended hurry in while there is still time",
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            _commercial(
+                10,
+                commercial_id=22,
+                transcript="hurry in while there is still time to save on Toyota Camry and Corolla",
+            )
+        )
+    )
+    out.extend(r.feed(_dj(20)))
+
+    assert len(out) == 1
+    assert out[0].category is BroadcastCategory.COMMERCIAL
+    assert out[0].timestamp_start == _ts(0)
+    assert out[0].timestamp_end == _ts(20)
+    assert out[0].brand_name == "Toyota"
+    assert out[0].commercial_id == 11
+
+
+def test_adjacent_commercial_windows_adopt_later_commercial_id_when_first_is_unresolved() -> None:
+    r = SegmentReducer()
+    out = []
+    out.extend(
+        r.feed(
+            _commercial(
+                0,
+                commercial_id=None,
+                transcript="Toyota Memorial Day offers are extended hurry in while there is still time",
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            _commercial(
+                10,
+                commercial_id=22,
+                transcript="hurry in while there is still time to save on Toyota Camry and Corolla",
+            )
+        )
+    )
+    out.extend(r.feed(_dj(20)))
+
+    assert len(out) == 1
+    assert out[0].commercial_id == 22
+
+
+def test_adjacent_commercial_windows_same_brand_different_transcript_stay_separate() -> None:
+    r = SegmentReducer()
+    out = []
+    out.extend(
+        r.feed(
+            _commercial(
+                0,
+                commercial_id=11,
+                transcript="Toyota Memorial Day offers are extended on Camry and Corolla",
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            _commercial(
+                10,
+                commercial_id=22,
+                transcript="Schedule your service appointment online for factory trained technicians",
+            )
+        )
+    )
+    out.extend(r.finalize(_ts(10), 10.0))
+
+    assert [(t.category, t.commercial_id, t.timestamp_start, t.timestamp_end) for t in out] == [
+        (BroadcastCategory.COMMERCIAL, 11, _ts(0), _ts(10)),
+        (BroadcastCategory.COMMERCIAL, 22, _ts(10), _ts(20)),
+    ]
+
+
 def test_unknown_song_bridge_merges_into_bracketing_song() -> None:
     r = SegmentReducer()
     out = []

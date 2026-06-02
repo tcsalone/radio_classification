@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -15,8 +16,38 @@ _ARTIST_DISPLAY_ALIASES = {
 }
 
 
+# Unicode apostrophe variants we routinely see on the wire. Shazam returns
+# the typographic right single quote U+2019 ("Picking Dragons’ Pockets")
+# while curated tracklists and Whisper outputs tend toward the ASCII form
+# ("Picking Dragons' Pockets"). U+02BC (modifier letter apostrophe) shows
+# up in some international band names, and U+2018 / U+201B for completeness.
+_TYPOGRAPHIC_APOSTROPHES = "\u2018\u2019\u02BC\u201B"
+
+
 def _display_key(value: str | None) -> str:
-    return " ".join((value or "").strip().split()).casefold()
+    """Normalize an artist/title field for case-insensitive identity matching.
+
+    Folds three classes of differences that have collapsed real song
+    identities into duplicate ``songs`` rows in production:
+
+    * Whitespace and case (long-standing behaviour).
+    * Typographic apostrophes (U+2019, U+2018, U+02BC, U+201B) versus ASCII
+      ``'``. Shazam → tracklist drift, observed on "Picking Dragons' Pockets".
+    * Filename-sanitizer underscores. Reference audio filenames replace
+      ``'`` with ``_`` (``Picking Dragons_ Pockets.mp3``); the audfprint
+      ``track_id`` parser surfaces those underscores in the title, while the
+      Shazam transcript keeps the original punctuation. Treating both as
+      empty in the key means they collapse onto the same song.
+
+    Apostrophes and underscores are *dropped* (not converted) because we
+    cannot reliably recover the original punctuation, and songs almost
+    never carry a semantically-meaningful underscore anyway.
+    """
+    raw = value or ""
+    for ch in _TYPOGRAPHIC_APOSTROPHES:
+        raw = raw.replace(ch, "'")
+    raw = raw.replace("'", "").replace("_", "")
+    return " ".join(raw.strip().split()).casefold()
 
 
 def _display_value(value: str | None, *, aliases: dict[str, str] | None = None) -> str | None:
@@ -34,6 +65,45 @@ def _display_value(value: str | None, *, aliases: dict[str, str] | None = None) 
 
 def _has_lowercase_letter(value: str | None) -> bool:
     return any(ch.isalpha() and ch.islower() for ch in value or "")
+
+
+_UNDERSCORE_BETWEEN_LETTERS_RE = re.compile(r"[A-Za-z0-9]_[A-Za-z0-9]")
+
+
+def _has_filename_artifact_underscore(value: str | None) -> bool:
+    """Detect underscores wedged between alphanumerics (filename sanitizer signature).
+
+    The seeding downloader replaces ``'`` with ``_`` in reference audio
+    filenames; the audfprint track-id parser then surfaces those underscores
+    in the song title (``Can_t Stop``). When a Shazam or curated-tracklist
+    title for the same song exists with the original apostrophe, we want to
+    prefer the cleaner display text on the canonical row.
+    """
+    if not value:
+        return False
+    return _UNDERSCORE_BETWEEN_LETTERS_RE.search(value) is not None
+
+
+def _apostrophe_quality(value: str | None) -> int:
+    """Rank how cleanly a title carries its apostrophe punctuation.
+
+    Used to break display-only ties between variants that already share a
+    ``_display_key``. Higher is better:
+
+    * ``2`` — ASCII ``'`` (the curated form we prefer for reports).
+    * ``1`` — any typographic apostrophe (``’``, ``‘``, ``ʼ``, ``’``). Still
+      a real apostrophe, just an inferior glyph for our text reports.
+    * ``0`` — no apostrophe at all (e.g. ``Adams Song`` for a song that
+      should be ``Adam's Song``). The normalizer drops apostrophes so
+      identity matches, but for display we'd rather keep them.
+    """
+    if not value:
+        return 0
+    if "'" in value:
+        return 2
+    if any(ch in value for ch in _TYPOGRAPHIC_APOSTROPHES):
+        return 1
+    return 0
 
 
 def _prefer_display_value(
@@ -64,6 +134,18 @@ def _prefer_display_value(
         return existing_clean
     if aliases and _display_key(existing_clean) in aliases:
         return incoming_clean
+    existing_has_artifact = _has_filename_artifact_underscore(existing_clean)
+    incoming_has_artifact = _has_filename_artifact_underscore(incoming_clean)
+    if existing_has_artifact and not incoming_has_artifact:
+        return incoming_clean
+    if incoming_has_artifact and not existing_has_artifact:
+        return existing_clean
+    existing_apos = _apostrophe_quality(existing_clean)
+    incoming_apos = _apostrophe_quality(incoming_clean)
+    if incoming_apos > existing_apos:
+        return incoming_clean
+    if existing_apos > incoming_apos:
+        return existing_clean
     if not _has_lowercase_letter(existing_clean) and _has_lowercase_letter(incoming_clean):
         return incoming_clean
     return existing_clean

@@ -15,6 +15,7 @@ from radio_classifier.segments.types import (
     SegmentKey,
     SegmentTransition,
 )
+from radio_classifier.text import text_similarity
 
 
 def _parse_utc(iso_z: str) -> datetime:
@@ -47,8 +48,22 @@ class SegmentReducer:
     and persist the returned closed transitions.
     """
 
-    def __init__(self, *, max_unknown_song_bridge_seconds: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        max_unknown_song_bridge_seconds: float = 60.0,
+        adjacent_commercial_similarity_threshold: float = 0.35,
+        max_adjacent_commercial_combined_seconds: float = 90.0,
+    ) -> None:
         self.max_unknown_song_bridge_seconds = max(0.0, max_unknown_song_bridge_seconds)
+        self.adjacent_commercial_similarity_threshold = max(
+            0.0,
+            adjacent_commercial_similarity_threshold,
+        )
+        self.max_adjacent_commercial_combined_seconds = max(
+            0.0,
+            max_adjacent_commercial_combined_seconds,
+        )
         self._current_key: SegmentKey | None = None
         self._current_start_utc: str | None = None
         self._artist: str | None = None
@@ -81,6 +96,11 @@ class SegmentReducer:
             return []
 
         if inp.key == self._current_key:
+            self._merge_display(inp)
+            return []
+
+        if self._can_merge_adjacent_commercial(inp):
+            self._merge_commercial_identity(inp)
             self._merge_display(inp)
             return []
 
@@ -230,6 +250,43 @@ class SegmentReducer:
     def _bridge_duration_before(self, end_utc: str) -> float:
         assert self._bridge_start_utc is not None
         return duration_seconds(self._bridge_start_utc, end_utc)
+
+    def _can_merge_adjacent_commercial(self, inp: SegmentInput) -> bool:
+        if (
+            self._current_key is None
+            or self._current_start_utc is None
+            or self._current_key.category is not BroadcastCategory.COMMERCIAL
+            or inp.key.category is not BroadcastCategory.COMMERCIAL
+        ):
+            return False
+        if self.max_adjacent_commercial_combined_seconds <= 0:
+            return False
+        current_duration = duration_seconds(self._current_start_utc, inp.window_start_utc)
+        if current_duration > self.max_adjacent_commercial_combined_seconds:
+            return False
+        if _commercial_brand_identity(self._current_key, self._brand) != _commercial_brand_identity(
+            inp.key,
+            inp.brand_name,
+        ):
+            return False
+        return (
+            text_similarity(self._transcript or "", inp.transcript_excerpt or "")
+            >= self.adjacent_commercial_similarity_threshold
+        )
+
+    def _merge_commercial_identity(self, inp: SegmentInput) -> None:
+        assert self._current_key is not None
+        if self._current_key.commercial_id is None and inp.key.commercial_id is not None:
+            self._current_key = inp.key
+
+
+def _commercial_brand_identity(key: SegmentKey, brand_name: str | None) -> str:
+    from radio_classifier.brands import canonicalize_brand
+
+    canonical = canonicalize_brand(brand_name)
+    if canonical:
+        return canonical.casefold()
+    return key.brand_key or ""
 
 
 def _is_identified_song(key: SegmentKey | None) -> bool:

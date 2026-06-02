@@ -223,6 +223,126 @@ def test_resolver_skips_short_or_long_segments(tmp_path: Path) -> None:
         store.close()
 
 
+def test_resolver_tertiary_cosine_path_matches_reordered_phrasings(tmp_path: Path) -> None:
+    """Two ASR passes of the same ad with reordered phrases.
+
+    3-shingle Jaccard drops sharply when the LLM/Whisper reorder noun phrases
+    (``Camry and Corolla`` vs ``Corolla and Camry``) even though virtually
+    every token survives. The tertiary token-cosine path is the safety net:
+    we already gated by brand+duration_bucket so the merge is bounded, and a
+    raw-token cosine over 0.85 is strong evidence of the same ad copy.
+    """
+    resolver, store = _resolver(tmp_path)
+    try:
+        transcript_a = (
+            "Toyota Memorial Day deals on Camry and Corolla "
+            "starting today hurry while supplies last"
+        )
+        transcript_b = (
+            "Toyota Memorial Day Corolla and Camry deals "
+            "starting today supplies last hurry now"
+        )
+        sig = CommercialSignature(
+            key_phrases=["memorial day deals", "camry corolla"],
+            duration_bucket_seconds=30,
+        )
+        r1 = resolver.resolve(
+            brand="Toyota",
+            transcript=transcript_a,
+            duration_seconds=30.0,
+            signature=sig,
+        )
+        r2 = resolver.resolve(
+            brand="Toyota",
+            transcript=transcript_b,
+            duration_seconds=30.0,
+            signature=sig,
+        )
+        assert r1.was_new is True
+        assert r2.was_new is False, "reordered same-ad transcript should match"
+        assert r2.commercial_id == r1.commercial_id
+        play_count = store.connection.execute(
+            "SELECT play_count FROM commercials WHERE id = ?", (r1.commercial_id,)
+        ).fetchone()[0]
+        assert play_count == 2
+    finally:
+        store.close()
+
+
+def test_resolver_does_not_merge_different_ads_with_same_brand_and_duration(
+    tmp_path: Path,
+) -> None:
+    """Tertiary cosine path must not collapse genuinely different ads.
+
+    Same brand, same duration bucket, but the actual ad copy diverges
+    (service vs sales). Token cosine should fall well below the tertiary
+    threshold and the resolver should insert a fresh row.
+    """
+    resolver, store = _resolver(tmp_path)
+    try:
+        r1 = resolver.resolve(
+            brand="Toyota",
+            transcript=(
+                "Toyota service center thirty nine dollar oil change "
+                "tire rotation included this month at your local dealer"
+            ),
+            duration_seconds=30.0,
+            signature=CommercialSignature(
+                key_phrases=["service center", "oil change"],
+                duration_bucket_seconds=30,
+            ),
+        )
+        r2 = resolver.resolve(
+            brand="Toyota",
+            transcript=(
+                "Toyota Memorial Day Camry Corolla offers extended through "
+                "the weekend hurry in while supplies last save thousands"
+            ),
+            duration_seconds=30.0,
+            signature=CommercialSignature(
+                key_phrases=["memorial day", "camry corolla"],
+                duration_bucket_seconds=30,
+            ),
+        )
+        assert r1.commercial_id is not None
+        assert r2.commercial_id is not None
+        assert r1.commercial_id != r2.commercial_id, (
+            "different ad copy for same brand+duration must stay separate"
+        )
+    finally:
+        store.close()
+
+
+def test_resolver_tertiary_path_disabled_when_threshold_zero(tmp_path: Path) -> None:
+    """``cosine_tertiary=0`` reverts to the legacy two-path resolver."""
+    resolver, store = _resolver(tmp_path)
+    try:
+        resolver.config = CommercialResolverConfig(cosine_tertiary=0.0)
+        transcript_a = (
+            "Toyota Memorial Day deals on Camry and Corolla "
+            "starting today hurry while supplies last"
+        )
+        transcript_b = (
+            "Toyota Memorial Day Corolla and Camry deals "
+            "starting today supplies last hurry now"
+        )
+        r1 = resolver.resolve(
+            brand="Toyota",
+            transcript=transcript_a,
+            duration_seconds=30.0,
+            signature=None,
+        )
+        r2 = resolver.resolve(
+            brand="Toyota",
+            transcript=transcript_b,
+            duration_seconds=30.0,
+            signature=None,
+        )
+        assert r1.commercial_id != r2.commercial_id
+    finally:
+        store.close()
+
+
 def test_resolver_secondary_threshold_kicks_in(tmp_path: Path) -> None:
     """Two commercials with moderate Jaccard but high cosine should match."""
     resolver, store = _resolver(

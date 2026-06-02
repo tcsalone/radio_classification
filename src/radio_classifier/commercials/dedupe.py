@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import math
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable
 
 from radio_classifier.brands import canonicalize_brand
 from radio_classifier.persistence.broadcast_store import BroadcastStore
-
-
-_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+from radio_classifier.text import text_similarity
 
 
 @dataclass
@@ -226,7 +221,7 @@ def _union_similar_transcripts(
     for group in by_key.values():
         for i, left in enumerate(group):
             for right in group[i + 1 :]:
-                similarity = _text_similarity(left.reference_transcript, right.reference_transcript)
+                similarity = text_similarity(left.reference_transcript, right.reference_transcript)
                 if similarity >= transcript_similarity_threshold:
                     union.union(left.commercial_id, right.commercial_id, "similar-transcript")
 
@@ -272,7 +267,7 @@ def _union_adjacent_splits(
             continue
         if _gap_seconds(prev[2], cur[1]) > max_adjacent_gap_seconds:
             continue
-        similarity = _text_similarity(prev_member.reference_transcript, cur_member.reference_transcript)
+        similarity = text_similarity(prev_member.reference_transcript, cur_member.reference_transcript)
         if similarity >= adjacent_similarity_threshold:
             union.union(prev_id, cur_id, "adjacent-split")
 
@@ -304,35 +299,9 @@ def _build_groups(union: _UnionFind) -> list[CommercialDedupeGroup]:
     return groups
 
 
-def _tokenize(text: str) -> list[str]:
-    return [t.casefold() for t in _WORD_RE.findall(text or "")]
-
-
 def _text_similarity(a: str, b: str) -> float:
-    """Combined token Jaccard / cosine similarity for ASR transcript text."""
-    a_tokens = _tokenize(a)
-    b_tokens = _tokenize(b)
-    if not a_tokens or not b_tokens:
-        return 0.0
-    a_set = set(a_tokens)
-    b_set = set(b_tokens)
-    jaccard = len(a_set & b_set) / len(a_set | b_set)
-    cosine = _cosine(a_tokens, b_tokens)
-    return max(jaccard, cosine)
-
-
-def _cosine(a: Iterable[str], b: Iterable[str]) -> float:
-    from collections import Counter
-
-    ca = Counter(a)
-    cb = Counter(b)
-    shared = set(ca) & set(cb)
-    num = sum(ca[t] * cb[t] for t in shared)
-    da = math.sqrt(sum(v * v for v in ca.values()))
-    db = math.sqrt(sum(v * v for v in cb.values()))
-    if da == 0 or db == 0:
-        return 0.0
-    return num / (da * db)
+    """Backward-compatible alias for older direct tests/imports."""
+    return text_similarity(a, b)
 
 
 def _gap_seconds(prev_end: str | None, next_start: str | None) -> float:

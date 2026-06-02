@@ -214,6 +214,172 @@ def test_promote_skips_normalized_duplicate(tmp_path: Path) -> None:
         store.close()
 
 
+def test_upsert_song_collapses_unicode_apostrophe_and_filename_underscore(
+    tmp_path: Path,
+) -> None:
+    """Three forms of the same song must resolve to one ``songs`` row.
+
+    Real-world drift seen in ``data/store/broadcast.db`` on 2026-06-01:
+
+    * Shazam returned ``Picking Dragons’ Pockets`` (U+2019).
+    * audfprint registered the reference recording as
+      ``Picking Dragons_ Pockets`` because the filename sanitizer
+      replaced the ASCII apostrophe with an underscore.
+    * The curated tracklist file used a plain ASCII apostrophe.
+
+    The store keyed identity on a casefold-only ``display_key``, so the
+    Shazam row and the audfprint row coexisted as separate songs and the
+    operator's discovery listing showed a "new" track that was already on
+    the tracklist. The fix normalizes typographic apostrophes to ASCII and
+    drops both apostrophes and filename-artifact underscores from the key.
+    """
+    store = BroadcastStore(tmp_path / "apostrophe.db")
+    try:
+        shazam_id = store.upsert_song(
+            artist="Modest Mouse",
+            title="Picking Dragons\u2019 Pockets",  # curly
+            source="shazam",
+        )
+        audfprint_id = store.upsert_song(
+            artist="Modest Mouse",
+            title="Picking Dragons_ Pockets",  # filename-sanitizer underscore
+            audfprint_track_id="data/reference/songs/Modest Mouse - Picking Dragons_ Pockets.mp3",
+            source="audfprint",
+        )
+        ascii_id = store.upsert_song(
+            artist="Modest Mouse",
+            title="Picking Dragons' Pockets",  # ASCII apostrophe
+            source="shazam",
+        )
+        assert shazam_id == audfprint_id == ascii_id, (
+            "three apostrophe/underscore variants should resolve to one song"
+        )
+        row = store.connection.execute(
+            "SELECT source, audfprint_track_id FROM songs WHERE id = ?",
+            (shazam_id,),
+        ).fetchone()
+        assert row[0] == "audfprint", "audfprint upgrade should stick"
+        assert row[1] is not None
+    finally:
+        store.close()
+
+
+def test_dedupe_folds_existing_apostrophe_underscore_duplicates(tmp_path: Path) -> None:
+    """A pre-fix DB with two duplicate rows should fold on dedupe.
+
+    Simulates the live row state captured on 2026-06-01: id=56 was the
+    Shazam row with U+2019, id=57 was the audfprint row with the filename
+    underscore. ``dedupe_songs`` must surface them as one group and pick
+    the audfprint row as the survivor.
+    """
+    store = BroadcastStore(tmp_path / "legacy-dupes.db")
+    conn = store.connection
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("Modest Mouse", "Picking Dragons\u2019 Pockets", "shazam", None),
+    )
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            "Modest Mouse",
+            "Picking Dragons_ Pockets",
+            "audfprint",
+            "data/reference/songs/Modest Mouse - Picking Dragons_ Pockets.mp3",
+        ),
+    )
+    conn.commit()
+    try:
+        report = dedupe_songs(store, dry_run=False)
+        assert report.collapsed_pairs == 1
+        assert report.rows_deleted == 1
+        survivors = conn.execute(
+            "SELECT artist, title, source, audfprint_track_id FROM songs "
+            "WHERE artist = 'Modest Mouse'"
+        ).fetchall()
+        assert len(survivors) == 1
+        assert survivors[0][2] == "audfprint", "audfprint row should survive"
+    finally:
+        store.close()
+
+
+def test_dedupe_upgrades_survivor_title_from_filename_underscore_to_apostrophe(
+    tmp_path: Path,
+) -> None:
+    """Even when the audfprint row wins on identity, dedupe should adopt the
+    cleaner apostrophe spelling from the Shazam loser for the displayed
+    title — the underscore is a filename-sanitizer artifact, not the way an
+    operator wants to see the song in reports."""
+    store = BroadcastStore(tmp_path / "display-upgrade.db")
+    conn = store.connection
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("Blink-182", "Adams Song", "shazam", None),
+    )
+    # Shazam loser with cleanest apostrophe spelling.
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        ("Blink-182", "Adam's Song", "shazam", None),
+    )
+    # audfprint survivor with filename-sanitizer underscore.
+    conn.execute(
+        "INSERT INTO songs (artist, title, source, audfprint_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            "Blink-182",
+            "Adam_s Song",
+            "audfprint",
+            "data/reference/songs/Blink-182 - Adam_s Song.mp3",
+        ),
+    )
+    conn.commit()
+    try:
+        report = dedupe_songs(store, dry_run=False)
+        assert report.collapsed_pairs == 2
+        survivors = conn.execute(
+            "SELECT artist, title, source, audfprint_track_id FROM songs "
+            "WHERE artist = 'Blink-182'"
+        ).fetchall()
+        assert len(survivors) == 1
+        artist, title, source, track_id = survivors[0]
+        assert source == "audfprint"
+        assert track_id is not None
+        assert title == "Adam's Song", (
+            "survivor should keep audfprint identity but adopt clean apostrophe spelling"
+        )
+    finally:
+        store.close()
+
+
+def test_promote_recognises_underscore_filename_artifact_as_already_in_tracklist(
+    tmp_path: Path,
+) -> None:
+    """A Shazam discovery whose title comes back with a filename underscore
+    must still be detected as already on the curated tracklist."""
+    store = BroadcastStore(tmp_path / "underscore.db")
+    tracklist = tmp_path / "tracklist.txt"
+    _write_tracklist(tracklist, ["Modest Mouse | Picking Dragons' Pockets"])
+    try:
+        song_id = store.upsert_song(
+            artist="Modest Mouse",
+            title="Picking Dragons_ Pockets",
+            source="shazam",
+        )
+        result = promote_to_tracklist(
+            store,
+            song_ids=[song_id],
+            tracklist_path=tracklist,
+        )
+        assert result.appended_count == 0
+        assert result.skipped_count == 1
+        assert result.promoted[0].reason == "already in tracklist"
+    finally:
+        store.close()
+
+
 def test_promote_skips_tracklist_match_with_apostrophe_and_feature_suffix(tmp_path: Path) -> None:
     store = BroadcastStore(tmp_path / "tracklist-normalize.db")
     tracklist = tmp_path / "tracklist.txt"
