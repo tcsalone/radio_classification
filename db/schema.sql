@@ -1,13 +1,13 @@
--- radio-classifier — schema v2
+-- radio-classifier — schema v3
 -- Five-class broadcast events with brand attribution, song fingerprinting,
--- and text-derived commercial identity.
+-- text-derived commercial identity, and capture-run provenance.
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '2');
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '3');
 
 CREATE TABLE IF NOT EXISTS brands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,6 +38,17 @@ CREATE TABLE IF NOT EXISTS commercials (
     UNIQUE (brand_id, duration_bucket_seconds, minhash_hex)
 );
 
+CREATE TABLE IF NOT EXISTS capture_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL UNIQUE,
+    started_utc TEXT NOT NULL,
+    ended_utc TEXT,
+    pipeline_version TEXT NOT NULL,
+    host TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
 CREATE TABLE IF NOT EXISTS broadcast_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp_start TEXT NOT NULL,
@@ -52,6 +63,7 @@ CREATE TABLE IF NOT EXISTS broadcast_events (
     brand_name TEXT,
     transcript_excerpt TEXT,
     confidence REAL,
+    capture_run_id INTEGER REFERENCES capture_runs(id),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -68,5 +80,6 @@ CREATE INDEX IF NOT EXISTS idx_events_category ON broadcast_events (category);
 CREATE INDEX IF NOT EXISTS idx_events_brand ON broadcast_events (brand_id);
 CREATE INDEX IF NOT EXISTS idx_events_song ON broadcast_events (song_id);
 CREATE INDEX IF NOT EXISTS idx_events_commercial ON broadcast_events (commercial_id);
+CREATE INDEX IF NOT EXISTS idx_events_capture_run ON broadcast_events (capture_run_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_brand_time ON brand_mentions (brand_id, heard_utc);
 CREATE INDEX IF NOT EXISTS idx_commercials_brand ON commercials (brand_id);

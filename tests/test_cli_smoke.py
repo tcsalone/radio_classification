@@ -436,23 +436,30 @@ def test_classify_help_lists_progress_flags() -> None:
     assert "--whisper-vad-filter" in proc.stdout
 
 
-def test_db_init_creates_v2_schema(tmp_path: Path) -> None:
+def test_db_init_creates_v3_schema(tmp_path: Path) -> None:
     db_path = tmp_path / "rc.db"
     proc = _run("db", "init", "--db-path", str(db_path))
     assert proc.returncode == 0, proc.stderr
     assert db_path.exists()
-    # Schema v2 is in place.
+    # Schema v3 is in place.
     import sqlite3
 
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
             "SELECT value FROM schema_meta WHERE key='version'"
         ).fetchone()
-        assert row == ("2",)
+        assert row == ("3",)
         tables = {r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
-        assert {"broadcast_events", "brands", "songs", "commercials", "brand_mentions"} <= tables
+        assert {
+            "broadcast_events",
+            "brands",
+            "songs",
+            "commercials",
+            "brand_mentions",
+            "capture_runs",
+        } <= tables
 
 
 def test_report_summary_empty_db(tmp_path: Path) -> None:

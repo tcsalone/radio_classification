@@ -19,7 +19,7 @@ def test_top_level_imports() -> None:
         speech,
     )
 
-    assert radio_classifier.__version__ == "0.1.0"
+    assert radio_classifier.__version__ == "0.3.0"
     # The packages export what their __init__ promised.
     assert hasattr(segments, "BroadcastCategory")
     assert hasattr(persistence, "BroadcastStore")

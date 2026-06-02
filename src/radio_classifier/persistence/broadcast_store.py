@@ -1,4 +1,4 @@
-"""SQLite persistence (schema v2) for broadcast segments, brands, songs, commercials."""
+"""SQLite persistence for broadcast segments, brands, songs, commercials, and runs."""
 
 from __future__ import annotations
 
@@ -83,12 +83,21 @@ def _ensure_database(db_path: Path, schema_path: Path) -> None:
     schema_sql = schema_path.read_text(encoding="utf-8")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
+        has_schema_meta = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'schema_meta'
+            """
+        ).fetchone()
+        if has_schema_meta is not None:
+            return
         conn.executescript(schema_sql)
         conn.commit()
 
 
 class BroadcastStore:
-    """Single-writer SQLite store for schema v2."""
+    """Single-writer SQLite store."""
 
     def __init__(
         self,
@@ -105,6 +114,7 @@ class BroadcastStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         if use_wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
+        self._migrate_schema()
         self._conn.commit()
 
     def close(self) -> None:
@@ -120,7 +130,7 @@ class BroadcastStore:
     def connection(self) -> sqlite3.Connection:
         return self._conn
 
-    def apply_transition(self, t: SegmentTransition) -> int:
+    def apply_transition(self, t: SegmentTransition, *, capture_run_id: int | None = None) -> int:
         """Insert one closed segment row. Returns ``broadcast_events.id``."""
         dur = duration_seconds(t.timestamp_start, t.timestamp_end)
         cur = self._conn.execute(
@@ -129,8 +139,8 @@ class BroadcastStore:
                 timestamp_start, timestamp_end, duration,
                 category, song_id, commercial_id, brand_id,
                 artist, track_title, brand_name,
-                transcript_excerpt, confidence
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transcript_excerpt, confidence, capture_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 t.timestamp_start,
@@ -145,10 +155,65 @@ class BroadcastStore:
                 t.brand_name,
                 t.transcript_excerpt,
                 t.confidence,
+                capture_run_id,
             ),
         )
         self._conn.commit()
         return int(cur.lastrowid or 0)
+
+    # ------------------------------------------------------------ capture runs
+    def open_capture_run(
+        self,
+        *,
+        run_id: str,
+        started_utc: str,
+        pipeline_version: str,
+        host: str | None = None,
+        notes: str | None = None,
+    ) -> int:
+        """Create or return a capture run row.
+
+        The operation is idempotent by ``run_id`` so restart wrappers can safely
+        retry after a crash without creating duplicate provenance rows.
+        """
+
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO capture_runs (
+                run_id, started_utc, pipeline_version, host, notes
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (run_id, started_utc, pipeline_version, host, notes),
+        )
+        row = self._conn.execute(
+            "SELECT id FROM capture_runs WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        self._conn.commit()
+        if row is None:
+            raise RuntimeError(f"failed to create capture_run {run_id!r}")
+        return int(row[0])
+
+    def close_capture_run(
+        self,
+        *,
+        run_id: str,
+        ended_utc: str,
+        notes: str | None = None,
+    ) -> None:
+        """Mark a capture run as ended."""
+
+        if notes is None:
+            self._conn.execute(
+                "UPDATE capture_runs SET ended_utc = ? WHERE run_id = ?",
+                (ended_utc, run_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE capture_runs SET ended_utc = ?, notes = ? WHERE run_id = ?",
+                (ended_utc, notes, run_id),
+            )
+        self._conn.commit()
 
     # ----------------------------------------------------------------- brands
     def upsert_brand(self, canonical_name: str, aliases: list[str] | None = None) -> int:
@@ -334,6 +399,89 @@ class BroadcastStore:
         return int(cur.lastrowid or 0)
 
     # ------------------------------------------------------------ schema meta
+    def _migrate_schema(self) -> None:
+        """Bring an existing database up to the latest schema.
+
+        ``db/schema.sql`` uses ``CREATE TABLE IF NOT EXISTS`` and
+        ``INSERT OR IGNORE`` for the version marker so opening an old v2 DB does
+        not accidentally mark it as v3 before the ALTER/backfill work runs.
+        """
+
+        version = self.schema_version()
+        if version in (None, "3"):
+            return
+        if version != "2":
+            raise RuntimeError(f"unsupported broadcast store schema version: {version}")
+        self._migrate_v2_to_v3()
+
+    def _migrate_v2_to_v3(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS capture_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                started_utc TEXT NOT NULL,
+                ended_utc TEXT,
+                pipeline_version TEXT NOT NULL,
+                host TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            """
+        )
+        if "capture_run_id" not in self._table_columns("broadcast_events"):
+            self._conn.execute(
+                "ALTER TABLE broadcast_events "
+                "ADD COLUMN capture_run_id INTEGER REFERENCES capture_runs(id)"
+            )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_capture_run "
+            "ON broadcast_events (capture_run_id)"
+        )
+        self._backfill_legacy_capture_run()
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '3')"
+        )
+
+    def _backfill_legacy_capture_run(self) -> None:
+        row = self._conn.execute(
+            """
+            SELECT MIN(timestamp_start), MAX(COALESCE(timestamp_end, timestamp_start)), COUNT(*)
+            FROM broadcast_events
+            """
+        ).fetchone()
+        if row is None or int(row[2] or 0) == 0:
+            return
+        started_utc = str(row[0])
+        ended_utc = str(row[1])
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO capture_runs (
+                run_id, started_utc, ended_utc, pipeline_version, notes
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy_pre_v3",
+                started_utc,
+                ended_utc,
+                "unknown",
+                "Backfilled during schema v3 migration",
+            ),
+        )
+        legacy_id = self._conn.execute(
+            "SELECT id FROM capture_runs WHERE run_id = 'legacy_pre_v3'"
+        ).fetchone()[0]
+        self._conn.execute(
+            "UPDATE broadcast_events SET capture_run_id = ? WHERE capture_run_id IS NULL",
+            (int(legacy_id),),
+        )
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        return {
+            str(row[1])
+            for row in self._conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+
     def schema_version(self) -> str | None:
         row = self._conn.execute(
             "SELECT value FROM schema_meta WHERE key = 'version'",

@@ -1,4 +1,4 @@
-"""BroadcastStore (schema v2) tests."""
+"""BroadcastStore schema and persistence tests."""
 
 from __future__ import annotations
 
@@ -18,10 +18,60 @@ from radio_classifier.segments import (
 )
 
 
-def test_store_creates_schema_v2(tmp_path: Path) -> None:
+def _create_minimal_v2_db(db: Path) -> None:
+    """Create just enough of schema v2 to exercise the v3 migration path."""
+
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO schema_meta (key, value) VALUES ('version', '2');
+
+            CREATE TABLE broadcast_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_start TEXT NOT NULL,
+                timestamp_end TEXT,
+                duration REAL,
+                category TEXT NOT NULL CHECK (
+                    category IN ('SONG', 'DJ', 'COMMERCIAL', 'STATION', 'PSA_NEWS')
+                ),
+                song_id INTEGER,
+                commercial_id INTEGER,
+                brand_id INTEGER,
+                artist TEXT,
+                track_title TEXT,
+                brand_name TEXT,
+                transcript_excerpt TEXT,
+                confidence REAL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+
+            INSERT INTO broadcast_events (
+                timestamp_start, timestamp_end, duration, category, artist, track_title
+            ) VALUES
+                ('2026-05-31T07:00:00.000Z', '2026-05-31T07:03:00.000Z', 180.0,
+                 'SONG', 'In Color', 'Headlights'),
+                ('2026-05-31T07:03:00.000Z', '2026-05-31T07:03:30.000Z', 30.0,
+                 'COMMERCIAL', NULL, NULL);
+            """
+        )
+
+
+def test_store_creates_schema_v3(tmp_path: Path) -> None:
     db = tmp_path / "rc.db"
     with BroadcastStore(db) as store:
-        assert store.schema_version() == "2"
+        assert store.schema_version() == "3"
+        columns = {
+            row[1]
+            for row in store.connection.execute("PRAGMA table_info(broadcast_events)").fetchall()
+        }
+        assert "capture_run_id" in columns
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'capture_runs'"
+        ).fetchone()[0] == 1
         # CHECK constraint should now reject the old 3-class enum value.
         with pytest.raises(sqlite3.IntegrityError):
             store.connection.execute(
@@ -29,6 +79,42 @@ def test_store_creates_schema_v2(tmp_path: Path) -> None:
                 "(timestamp_start, category) VALUES (?, ?)",
                 ("2020-01-01T00:00:00.000Z", "MUSIC"),
             )
+
+
+def test_store_migrates_v2_to_v3_and_backfills_legacy_run(tmp_path: Path) -> None:
+    db = tmp_path / "rc.db"
+    _create_minimal_v2_db(db)
+
+    with BroadcastStore(db) as store:
+        assert store.schema_version() == "3"
+        columns = {
+            row[1]
+            for row in store.connection.execute("PRAGMA table_info(broadcast_events)").fetchall()
+        }
+        assert "capture_run_id" in columns
+
+        run = store.connection.execute(
+            """
+            SELECT id, run_id, started_utc, ended_utc, pipeline_version
+            FROM capture_runs
+            """
+        ).fetchone()
+        assert run[1:] == (
+            "legacy_pre_v3",
+            "2026-05-31T07:00:00.000Z",
+            "2026-05-31T07:03:30.000Z",
+            "unknown",
+        )
+        assert store.connection.execute(
+            "SELECT COUNT(*) FROM broadcast_events WHERE capture_run_id = ?",
+            (run[0],),
+        ).fetchone()[0] == 2
+
+    # Reopening should be idempotent: no duplicate capture_run rows, no errors.
+    with BroadcastStore(db) as store:
+        assert store.schema_version() == "3"
+        assert store.connection.execute("SELECT COUNT(*) FROM capture_runs").fetchone()[0] == 1
+        assert store.connection.execute("SELECT COUNT(*) FROM broadcast_events").fetchone()[0] == 2
 
 
 def test_apply_transition_round_trips(tmp_path: Path) -> None:
@@ -58,6 +144,49 @@ def test_apply_transition_round_trips(tmp_path: Path) -> None:
         assert row == ("COMMERCIAL", 20.0, brand_id, "Geico")
         # Sanity: songs row exists too.
         assert store.upsert_song(artist="Taylor Swift", title="Anti-Hero") == song_id
+
+
+def test_capture_run_lifecycle_and_event_link(tmp_path: Path) -> None:
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        run_id = store.open_capture_run(
+            run_id="continuous_test",
+            started_utc="2026-06-01T00:00:00.000Z",
+            pipeline_version="0.3.0+test",
+            host="test-host",
+            notes="smoke",
+        )
+        assert store.open_capture_run(
+            run_id="continuous_test",
+            started_utc="2026-06-01T00:00:00.000Z",
+            pipeline_version="0.3.0+test",
+        ) == run_id
+
+        event_id = store.apply_transition(
+            SegmentTransition(
+                timestamp_start="2026-06-01T00:00:00.000Z",
+                timestamp_end="2026-06-01T00:03:00.000Z",
+                category=BroadcastCategory.SONG,
+                artist="Radiohead",
+                track_title="Karma Police",
+            ),
+            capture_run_id=run_id,
+        )
+        assert store.connection.execute(
+            "SELECT capture_run_id FROM broadcast_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()[0] == run_id
+
+        store.close_capture_run(
+            run_id="continuous_test",
+            ended_utc="2026-06-01T00:03:00.000Z",
+            notes="done",
+        )
+        row = store.connection.execute(
+            "SELECT ended_utc, notes FROM capture_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row == ("2026-06-01T00:03:00.000Z", "done")
 
 
 def test_upsert_brand_is_idempotent(tmp_path: Path) -> None:
