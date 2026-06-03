@@ -8,9 +8,12 @@ in :mod:`...reports.cli`.
 from __future__ import annotations
 
 import re
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from radio_classifier.brands import canonicalize_brand
+from radio_classifier.discovery.releases import parse_reference_utc, song_age_years
 from radio_classifier.persistence.broadcast_store import BroadcastStore
 
 PROMO_MAX_SPIN_SECONDS: float = 90.0
@@ -90,6 +93,24 @@ class BrandRow:
     paid_play_count: int
     dj_shoutout_count: int
     tag_count: int
+
+
+@dataclass
+class CommercialBrandRow:
+    """Commercial airplay rolled up by canonical brand.
+
+    ``brand`` is ``None`` for the unbranded bucket — COMMERCIAL events the
+    funnel detected but could not attribute to an advertiser (no brand
+    extracted, so no ``commercial_id`` was assigned). ``distinct_ads`` counts
+    the unique ``commercials`` rows that contributed, which exposes per-brand
+    creative variety without fragmenting the table into one row per ad.
+    """
+
+    brand: str | None
+    distinct_ads: int
+    play_count: int
+    total_duration_seconds: float
+    last_heard_utc: str | None
 
 
 @dataclass
@@ -274,6 +295,18 @@ class SummaryRow:
 
 
 @dataclass
+class SongAgeStats:
+    """Age of songs played in a report window (years since release)."""
+
+    songs_with_dates: int
+    songs_missing_dates: int
+    distinct_song_mean_years: float | None
+    distinct_song_median_years: float | None
+    airtime_weighted_mean_years: float | None
+    reference_utc: str
+
+
+@dataclass
 class SongsAddedRow:
     song_id: int
     first_seen_utc: str
@@ -348,6 +381,69 @@ def commercials_top(
         )
         for r in rows
     ]
+
+
+def commercials_by_brand(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+    top_n: int = 10,
+) -> list[CommercialBrandRow]:
+    """Roll commercial airplay up by canonical brand.
+
+    Unlike :func:`commercials_top` (one row per ``commercial_id``), this folds
+    every ad for an advertiser into a single row and surfaces the unbranded
+    bucket (``brand is None``) explicitly. It is the dashboard-friendly view:
+    naming variants and same-ad-different-offset duplicates no longer split a
+    brand across several rows.
+
+    Brand names are folded through :func:`canonicalize_brand` at query time so
+    alias variants (e.g. ``Ethos Insurance`` → ``Ethos``) collapse even when the
+    underlying ``brands`` rows were inserted before the alias existed.
+    """
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    sql = """
+        SELECT
+            b.canonical_name AS brand,
+            e.commercial_id AS commercial_id,
+            COUNT(*) AS play_count,
+            COALESCE(SUM(e.duration), 0.0) AS total_duration,
+            MAX(e.timestamp_start) AS last_heard_utc
+        FROM broadcast_events e
+        LEFT JOIN commercials c ON e.commercial_id = c.id
+        LEFT JOIN brands b ON COALESCE(c.brand_id, e.brand_id) = b.id
+        WHERE e.category = 'COMMERCIAL' AND {window_clause}
+        GROUP BY b.canonical_name, e.commercial_id
+    """.format(window_clause=window_clause)
+    rows = store.connection.execute(sql, args).fetchall()
+
+    folded: dict[str | None, dict] = {}
+    for raw_brand, commercial_id, play_count, total_duration, last_heard in rows:
+        canonical = canonicalize_brand(raw_brand) if raw_brand else None
+        bucket = folded.setdefault(
+            canonical,
+            {"distinct_ads": set(), "play_count": 0, "total_duration": 0.0, "last_heard": None},
+        )
+        if commercial_id is not None:
+            bucket["distinct_ads"].add(int(commercial_id))
+        bucket["play_count"] += int(play_count)
+        bucket["total_duration"] += float(total_duration or 0.0)
+        if last_heard and (bucket["last_heard"] is None or last_heard > bucket["last_heard"]):
+            bucket["last_heard"] = last_heard
+
+    result = [
+        CommercialBrandRow(
+            brand=brand,
+            distinct_ads=len(data["distinct_ads"]),
+            play_count=data["play_count"],
+            total_duration_seconds=data["total_duration"],
+            last_heard_utc=data["last_heard"],
+        )
+        for brand, data in folded.items()
+    ]
+    result.sort(key=lambda r: (-r.play_count, -r.total_duration_seconds))
+    return result[:top_n]
 
 
 def brands_top(
@@ -712,6 +808,72 @@ def summary(
         )
         for r in rows
     ]
+
+
+def song_age_stats(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+    reference_utc: str | None = None,
+) -> SongAgeStats:
+    """Mean/median song age for distinct songs heard in the window.
+
+    * **Distinct-song mean/median** — one age per ``song_id`` with a known
+      ``release_date``.
+    * **Airtime-weighted mean** — weights each song's age by total ``SONG``
+      event duration in the window (closer to "how old was the music we
+      actually aired?").
+    """
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    sql = f"""
+        SELECT
+            s.id,
+            s.release_date,
+            COALESCE(SUM(e.duration), 0.0) AS song_airtime
+        FROM broadcast_events e
+        JOIN songs s ON s.id = e.song_id
+        WHERE e.category = 'SONG'
+          AND {window_clause}
+        GROUP BY s.id, s.release_date
+    """
+    rows = store.connection.execute(sql, args).fetchall()
+    reference = parse_reference_utc(reference_utc or until_utc)
+    reference_iso = reference.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+    ages: list[float] = []
+    weighted_num = 0.0
+    weighted_den = 0.0
+    missing = 0
+
+    for r in rows:
+        release_date = r[1]
+        airtime = float(r[2] or 0.0)
+        if not release_date:
+            missing += 1
+            continue
+        try:
+            age = song_age_years(str(release_date), reference)
+        except ValueError:
+            missing += 1
+            continue
+        ages.append(age)
+        if airtime > 0:
+            weighted_num += age * airtime
+            weighted_den += airtime
+
+    mean_years = statistics.mean(ages) if ages else None
+    median_years = statistics.median(ages) if ages else None
+    airtime_mean = (weighted_num / weighted_den) if weighted_den > 0 else None
+
+    return SongAgeStats(
+        songs_with_dates=len(ages),
+        songs_missing_dates=missing,
+        distinct_song_mean_years=mean_years,
+        distinct_song_median_years=median_years,
+        airtime_weighted_mean_years=airtime_mean,
+        reference_utc=reference_iso,
+    )
 
 
 def songs_added(

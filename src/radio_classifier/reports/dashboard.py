@@ -8,9 +8,11 @@ from pathlib import Path
 from radio_classifier.persistence.broadcast_store import BroadcastStore
 from radio_classifier.reports.format import _format_seconds
 from radio_classifier.reports.queries import (
+    SongAgeStats,
     artists_top,
     brands_top,
-    commercials_top,
+    commercials_by_brand,
+    song_age_stats,
     songs_top,
     summary,
 )
@@ -20,11 +22,17 @@ def write_dashboard(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     out_path: Path,
     top_n: int = 10,
 ) -> Path:
     """Write a dependency-free HTML dashboard and return its path."""
-    html = render_dashboard_html(store, since_utc=since_utc, top_n=top_n)
+    html = render_dashboard_html(
+        store,
+        since_utc=since_utc,
+        until_utc=until_utc,
+        top_n=top_n,
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")
     return out_path
@@ -34,15 +42,22 @@ def render_dashboard_html(
     store: BroadcastStore,
     *,
     since_utc: str,
+    until_utc: str | None = None,
     top_n: int = 10,
 ) -> str:
     """Render a static metrics page for one DB/time window."""
-    summary_rows = summary(store, since_utc=since_utc)
-    song_rows = songs_top(store, since_utc=since_utc, top_n=top_n)
-    artist_rows = artists_top(store, since_utc=since_utc, top_n=top_n)
-    brand_rows = brands_top(store, since_utc=since_utc, top_n=top_n)
-    commercial_rows = commercials_top(store, since_utc=since_utc, top_n=top_n)
-    hourly_rows = _hourly_category_rows(store, since_utc=since_utc)
+    summary_rows = summary(store, since_utc=since_utc, until_utc=until_utc)
+    song_rows = songs_top(store, since_utc=since_utc, until_utc=until_utc, top_n=top_n)
+    artist_rows = artists_top(store, since_utc=since_utc, until_utc=until_utc, top_n=top_n)
+    brand_rows = brands_top(store, since_utc=since_utc, until_utc=until_utc, top_n=top_n)
+    commercial_rows = commercials_by_brand(store, since_utc=since_utc, until_utc=until_utc, top_n=top_n)
+    hourly_rows = _hourly_category_rows(store, since_utc=since_utc, until_utc=until_utc)
+    age_stats = song_age_stats(
+        store,
+        since_utc=since_utc,
+        until_utc=until_utc,
+        reference_utc=until_utc,
+    )
 
     total_airtime = sum(r.total_duration_seconds for r in summary_rows)
     total_segments = sum(r.segment_count for r in summary_rows)
@@ -69,7 +84,13 @@ def render_dashboard_html(
             "<header>",
             "<p class=\"eyebrow\">radio-classifier</p>",
             "<h1>Broadcast Metrics Dashboard</h1>",
-            f"<p>Window starts at <code>{escape(since_utc)}</code>. Generated from the selected SQLite DB.</p>",
+            f"<p>Window <code>{escape(since_utc)}</code>"
+            + (
+                f" → <code>{escape(until_utc)}</code>"
+                if until_utc
+                else " → now"
+            )
+            + ". Generated from the selected SQLite DB.</p>",
             "</header>",
             '<section class="cards">',
             _metric_card("Classified Airtime", _format_seconds(total_airtime), "Sum of event durations"),
@@ -77,12 +98,13 @@ def render_dashboard_html(
             _metric_card("Music Share", f"{song_share:.1f}%", "SONG airtime / classified airtime"),
             _metric_card("Commercial Share", f"{commercial_share:.1f}%", "COMMERCIAL airtime / classified airtime"),
             "</section>",
+            _song_age_section(age_stats),
             '<section class="grid">',
             _panel("Category Airtime", _category_bars(summary_rows)),
             _panel("Top Artists", _artists_table(artist_rows)),
             _panel("Top Songs", _songs_table(song_rows)),
             _panel("Top Brands", _brands_table(brand_rows)),
-            _panel("Top Commercials", _commercials_table(commercial_rows)),
+            _panel("Top Commercials (by brand)", _commercials_table(commercial_rows)),
             _panel("Hourly Category Mix", _hourly_table(hourly_rows)),
             "</section>",
             "</main>",
@@ -90,6 +112,40 @@ def render_dashboard_html(
             "</html>",
         ]
     )
+
+
+def _song_age_section(stats: SongAgeStats) -> str:
+    if stats.songs_with_dates == 0:
+        body = (
+            '<p class="empty">No release dates yet. Run '
+            "<code>radio-classifier songs enrich-releases</code> "
+            "for this window, then regenerate the dashboard.</p>"
+        )
+    else:
+        mean = _fmt_years(stats.distinct_song_mean_years)
+        median = _fmt_years(stats.distinct_song_median_years)
+        airtime = _fmt_years(stats.airtime_weighted_mean_years)
+        body = (
+            '<div class="age-grid">'
+            + _metric_card("Mean Song Age", mean, "Distinct songs with known release dates")
+            + _metric_card("Median Song Age", median, "50th percentile by distinct song")
+            + _metric_card("Airtime-Weighted Age", airtime, "Weighted by SONG segment duration")
+            + _metric_card(
+                "Catalog Coverage",
+                f"{stats.songs_with_dates} / {stats.songs_with_dates + stats.songs_missing_dates}",
+                f"Known dates; {stats.songs_missing_dates} played songs still missing",
+            )
+            + "</div>"
+            + f'<p class="muted">Ages measured to <code>{escape(stats.reference_utc)}</code> '
+            "via MusicBrainz release dates.</p>"
+        )
+    return f'<section class="panel age-panel"><h2>Song Age</h2>{body}</section>'
+
+
+def _fmt_years(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.1f} yr"
 
 
 def _metric_card(label: str, value: str, note: str) -> str:
@@ -206,11 +262,11 @@ def _brands_table(rows) -> str:  # type: ignore[no-untyped-def]
 
 def _commercials_table(rows) -> str:  # type: ignore[no-untyped-def]
     return _table(
-        ["ID", "Brand", "Plays", "Airtime", "Last Heard"],
+        ["Brand", "Ads", "Plays", "Airtime", "Last Heard"],
         [
             [
-                str(r.commercial_id if r.commercial_id is not None else "?"),
-                r.brand or "?",
+                r.brand or "Unbranded / unidentified",
+                str(r.distinct_ads) if r.brand else "—",
                 str(r.play_count),
                 _format_seconds(r.total_duration_seconds),
                 r.last_heard_utc or "?",
@@ -256,20 +312,30 @@ def _table(
     return f"<div class=\"table-wrap\"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
-def _hourly_category_rows(store: BroadcastStore, *, since_utc: str) -> list[tuple[str, str, int, float]]:
+def _hourly_category_rows(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+) -> list[tuple[str, str, int, float]]:
+    window = "timestamp_start >= ?"
+    args: list[str] = [since_utc]
+    if until_utc:
+        window += " AND timestamp_start < ?"
+        args.append(until_utc)
     rows = store.connection.execute(
-        """
+        f"""
         SELECT
             substr(timestamp_start, 1, 13) || ':00Z' AS hour_utc,
             category,
             COUNT(*) AS segments,
             COALESCE(SUM(duration), 0.0) AS total_duration
         FROM broadcast_events
-        WHERE timestamp_start >= ?
+        WHERE {window}
         GROUP BY hour_utc, category
         ORDER BY hour_utc ASC, total_duration DESC
         """,
-        (since_utc,),
+        args,
     ).fetchall()
     return [(str(r[0]), str(r[1]), int(r[2] or 0), float(r[3] or 0.0)) for r in rows]
 
@@ -304,6 +370,8 @@ p { color: var(--muted); margin: 0; }
 code { color: var(--accent); }
 .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: .16em; font-weight: 700; }
 .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 14px; }
+.age-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.age-panel { margin-bottom: 14px; }
 .card, .panel { background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 20px 60px #0006; }
 .card { padding: 16px; }
 .card span, .card small { color: var(--muted); display: block; }

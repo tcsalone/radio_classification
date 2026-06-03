@@ -11,6 +11,7 @@ from radio_classifier.persistence import BroadcastStore
 from radio_classifier.reports import (
     artists_top,
     brands_top,
+    commercials_by_brand,
     commercials_top,
     format_artists,
     format_brands,
@@ -134,6 +135,67 @@ def test_commercials_top_orders_by_play_count(tmp_path: Path) -> None:
         assert rows[0].brand == "Geico"
         assert rows[0].play_count == 3
         assert any(r.brand == "Toyota" and r.play_count == 1 for r in rows)
+    finally:
+        store.close()
+
+
+def test_commercials_by_brand_folds_aliases_and_surfaces_unbranded(tmp_path: Path) -> None:
+    """Brand rollup collapses alias variants and exposes the no-brand bucket."""
+    store = BroadcastStore(tmp_path / "rollup.db")
+    try:
+        now = datetime.now(tz=timezone.utc)
+        # Two physically separate brand rows that canonicalize to one advertiser.
+        ethos = store.upsert_brand("Ethos")
+        ethos_ins = store.upsert_brand("Ethos Insurance")
+        ad_a = store.insert_commercial(
+            brand_id=ethos,
+            duration_bucket_seconds=20,
+            minhash_hex="aa" * 8,
+            reference_transcript="get a quote in seconds",
+        )
+        ad_b = store.insert_commercial(
+            brand_id=ethos_ins,
+            duration_bucket_seconds=20,
+            minhash_hex="bb" * 8,
+            reference_transcript="no medical exam life insurance",
+        )
+        for idx, (brand_name, brand_id, ad) in enumerate(
+            [("Ethos", ethos, ad_a), ("Ethos Insurance", ethos_ins, ad_b)]
+        ):
+            start = now - timedelta(minutes=10 + idx)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=20)),
+                    category=BroadcastCategory.COMMERCIAL,
+                    brand_name=brand_name,
+                    brand_id=brand_id,
+                    commercial_id=ad,
+                )
+            )
+        # An unbranded commercial event: detected COMMERCIAL, no brand/identity.
+        start = now - timedelta(minutes=5)
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(start),
+                timestamp_end=_iso(start + timedelta(seconds=10)),
+                category=BroadcastCategory.COMMERCIAL,
+            )
+        )
+
+        rows = commercials_by_brand(store, since_utc=parse_since("1d"))
+        by_brand = {r.brand: r for r in rows}
+
+        # Both Ethos variants fold into a single canonical row with 2 distinct ads.
+        assert "Ethos" in by_brand
+        assert "Ethos Insurance" not in by_brand
+        assert by_brand["Ethos"].distinct_ads == 2
+        assert by_brand["Ethos"].play_count == 2
+
+        # The unbranded bucket is surfaced explicitly with no distinct-ad count.
+        assert None in by_brand
+        assert by_brand[None].play_count == 1
+        assert by_brand[None].distinct_ads == 0
     finally:
         store.close()
 

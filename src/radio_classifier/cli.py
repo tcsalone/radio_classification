@@ -677,6 +677,27 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     songs_dedupe.add_argument("--db-path", type=Path, default=None)
+    songs_enrich = songs_sub.add_parser(
+        "enrich-releases",
+        help="Fetch MusicBrainz release dates for songs (rate-limited)",
+    )
+    songs_enrich.add_argument("--db-path", type=Path, default=None)
+    songs_enrich.add_argument("--since", type=str, default=None)
+    songs_enrich.add_argument("--from", dest="from_utc", type=str, default=None)
+    songs_enrich.add_argument("--to", dest="until_utc", type=str, default=None)
+    songs_enrich.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max songs to query (default: all candidates)",
+    )
+    songs_enrich.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Re-query even when release_date is already set",
+    )
+    songs_enrich.add_argument("--dry-run", action="store_true")
+
     songs_dedupe.add_argument(
         "--dry-run",
         action="store_true",
@@ -703,6 +724,80 @@ def _build_parser() -> argparse.ArgumentParser:
         "--apply",
         action="store_true",
         help="Apply the dedupe plan. Without this flag the command is read-only.",
+    )
+    commercials_backfill = commercials_sub.add_parser(
+        "backfill-brands",
+        help="Recover brands for unbranded COMMERCIAL events from their transcripts.",
+    )
+    commercials_backfill.add_argument("--db-path", type=Path, default=None)
+    commercials_backfill.add_argument(
+        "--since", type=str, default=None, help="Window start as duration/ISO (default: all)"
+    )
+    commercials_backfill.add_argument(
+        "--from", dest="from_utc", type=str, default=None, help="Explicit inclusive UTC window start"
+    )
+    commercials_backfill.add_argument(
+        "--to", dest="until_utc", type=str, default=None, help="Explicit exclusive UTC window end"
+    )
+    commercials_backfill.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview brand assignments without modifying the DB (default).",
+    )
+    commercials_backfill.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the backfill. Without this flag the command is read-only.",
+    )
+    commercials_backfill.add_argument(
+        "--llm",
+        action="store_true",
+        help="Consult the local Ollama classifier for events the deterministic pass cannot brand.",
+    )
+    commercials_backfill.add_argument(
+        "--ollama-model",
+        type=str,
+        default=None,
+        help="Override the Ollama model for --llm (default: env / llama3.2).",
+    )
+    commercials_backfill.add_argument(
+        "--limit", type=int, default=None, help="Cap the number of events processed."
+    )
+    commercials_merge = commercials_sub.add_parser(
+        "merge-boundaries",
+        help="Attribute unbranded commercial fragments to an adjacent branded ad (window-overlap orphans).",
+    )
+    commercials_merge.add_argument("--db-path", type=Path, default=None)
+    commercials_merge.add_argument(
+        "--since", type=str, default=None, help="Window start as duration/ISO (default: all)"
+    )
+    commercials_merge.add_argument(
+        "--from", dest="from_utc", type=str, default=None, help="Explicit inclusive UTC window start"
+    )
+    commercials_merge.add_argument(
+        "--to", dest="until_utc", type=str, default=None, help="Explicit exclusive UTC window end"
+    )
+    commercials_merge.add_argument(
+        "--min-similarity",
+        type=float,
+        default=0.55,
+        help="Minimum transcript similarity to a branded neighbor to merge (default: 0.55).",
+    )
+    commercials_merge.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=12.0,
+        help="Maximum gap to the branded neighbor (default: 12s).",
+    )
+    commercials_merge.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview merges without modifying the DB (default).",
+    )
+    commercials_merge.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the merges. Without this flag the command is read-only.",
     )
 
     return p
@@ -1784,13 +1879,11 @@ def cmd_report(args: argparse.Namespace) -> int:
             rows = runs_summary(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
             print(format_runs(rows))
         elif args.report_command == "dashboard":
-            if until_utc is not None:
-                print("radio-classifier report dashboard: --to is not supported yet", file=sys.stderr)
-                return 2
             out_path = args.out or (_project_root() / "data" / "reports" / "dashboard.html")
             written = write_dashboard(
                 store,
                 since_utc=since_utc,
+                until_utc=until_utc,
                 out_path=out_path,
                 top_n=args.top,
             )
@@ -1981,6 +2074,40 @@ def cmd_songs_promote(args: argparse.Namespace) -> int:
     return 0 if appended or not skipped else 1
 
 
+def cmd_songs_enrich_releases(args: argparse.Namespace) -> int:
+    from radio_classifier.discovery.releases import enrich_song_releases
+    from radio_classifier.reports.queries import parse_since
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(f"radio-classifier songs enrich-releases: db not found: {db_path}", file=sys.stderr)
+        return 1
+
+    since_utc: str | None = None
+    until_utc: str | None = None
+    if args.from_utc or args.until_utc or args.since:
+        since_utc, until_utc = _report_window(args, parse_since)
+
+    with BroadcastStore(db_path) as store:
+        report = enrich_song_releases(
+            store,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            only_missing=not args.include_existing,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+
+    verb = "would update" if args.dry_run else "updated"
+    print(
+        f"radio-classifier songs enrich-releases: examined={report.examined} "
+        f"{verb}={report.updated} not_found={report.not_found} "
+        f"errors={report.errors} skipped_existing={report.skipped_existing}",
+        file=sys.stderr,
+    )
+    return 0 if report.errors == 0 else 1
+
+
 def cmd_songs_dedupe(args: argparse.Namespace) -> int:
     from radio_classifier.discovery import dedupe_songs
 
@@ -2073,6 +2200,127 @@ def cmd_commercials_dedupe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_commercials_backfill_brands(args: argparse.Namespace) -> int:
+    from radio_classifier.commercials import backfill_unbranded_commercials
+    from radio_classifier.reports import parse_since
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(
+            f"radio-classifier commercials backfill-brands: db not found: {db_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Window is optional here (default: whole DB), unlike report commands.
+    if (args.from_utc or args.until_utc) and args.since:
+        raise _CliConfigError(
+            "backfill window accepts either --since or --from/--to, not both"
+        )
+    if args.from_utc:
+        since_utc: str | None = _normalize_utc_text(args.from_utc)
+    elif args.since:
+        since_utc = parse_since(args.since)
+    else:
+        since_utc = None
+    until_utc = _normalize_utc_text(args.until_utc) if args.until_utc else None
+
+    classifier = None
+    if args.llm:
+        from radio_classifier.speech.ollama import OllamaSpeechClassifier
+
+        classifier = OllamaSpeechClassifier(model=args.ollama_model)
+
+    dry_run = True if args.dry_run else not args.apply
+    with BroadcastStore(db_path) as store:
+        report = backfill_unbranded_commercials(
+            store,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            dry_run=dry_run,
+            classifier=classifier,
+            limit=args.limit,
+        )
+
+    verb = "would brand" if report.dry_run else "branded"
+    print(
+        f"radio-classifier: {verb} {report.events_branded} of {report.events_scanned} "
+        f"unbranded commercial event(s) "
+        f"(deterministic={report.deterministic_hits}, llm={report.llm_hits}"
+        + (f", llm_errors={report.llm_errors}" if report.llm_errors else "")
+        + ")",
+        file=sys.stderr,
+    )
+    from collections import Counter
+
+    by_brand = Counter(item.brand for item in report.items)
+    for brand, count in sorted(by_brand.items(), key=lambda kv: (-kv[1], kv[0])):
+        sources = {item.source for item in report.items if item.brand == brand}
+        print(f"  {brand!r}: {count} event(s) [{'+'.join(sorted(sources))}]", file=sys.stderr)
+
+    if report.events_scanned and report.events_branded == 0:
+        print(
+            "radio-classifier: no brands recovered "
+            "(try --llm with a running Ollama server for higher recall)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_commercials_merge_boundaries(args: argparse.Namespace) -> int:
+    from radio_classifier.commercials import merge_boundary_commercials
+    from radio_classifier.reports import parse_since
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(
+            f"radio-classifier commercials merge-boundaries: db not found: {db_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if (args.from_utc or args.until_utc) and args.since:
+        raise _CliConfigError(
+            "merge-boundaries window accepts either --since or --from/--to, not both"
+        )
+    if args.from_utc:
+        since_utc: str | None = _normalize_utc_text(args.from_utc)
+    elif args.since:
+        since_utc = parse_since(args.since)
+    else:
+        since_utc = None
+    until_utc = _normalize_utc_text(args.until_utc) if args.until_utc else None
+
+    dry_run = True if args.dry_run else not args.apply
+    with BroadcastStore(db_path) as store:
+        report = merge_boundary_commercials(
+            store,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            min_similarity=args.min_similarity,
+            max_gap_seconds=args.max_gap_seconds,
+            dry_run=dry_run,
+        )
+
+    verb = "would merge" if report.dry_run else "merged"
+    print(
+        f"radio-classifier: {verb} {report.events_merged} of {report.events_scanned} "
+        f"unbranded commercial fragment(s) into a branded neighbor "
+        f"(min-similarity={args.min_similarity})",
+        file=sys.stderr,
+    )
+    from collections import Counter
+
+    by_brand = Counter(item.brand for item in report.items)
+    for brand, count in sorted(by_brand.items(), key=lambda kv: (-kv[1], kv[0])):
+        sims = [item.similarity for item in report.items if item.brand == brand]
+        print(
+            f"  {brand!r}: {count} fragment(s) [sim {min(sims):.2f}-{max(sims):.2f}]",
+            file=sys.stderr,
+        )
+    return 0
+
+
 # -------------------------------------------------------------------- main
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
@@ -2120,10 +2368,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_songs_promote(args)
             if args.songs_command == "dedupe":
                 return cmd_songs_dedupe(args)
+            if args.songs_command == "enrich-releases":
+                return cmd_songs_enrich_releases(args)
             return 2
         if args.command == "commercials":
             if args.commercials_command == "dedupe":
                 return cmd_commercials_dedupe(args)
+            if args.commercials_command == "backfill-brands":
+                return cmd_commercials_backfill_brands(args)
+            if args.commercials_command == "merge-boundaries":
+                return cmd_commercials_merge_boundaries(args)
             return 2
         return 1
     except _CliConfigError as exc:

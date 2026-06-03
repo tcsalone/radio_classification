@@ -68,6 +68,18 @@ _BRAND_ALIASES: dict[str, str] = {
     normalize_token("Eyserve"): "Izervay",
     normalize_token("EvasenQ"): "Izervay",
     normalize_token("Eye Survey"): "Izervay",
+    # 2026-06-02 20h-run advertiser naming variants. Same advertiser emitted by
+    # the LLM under two spellings, which fragmented the dashboard's commercial
+    # rollup. Folding the variant into the more common canonical form.
+    normalize_token("Ethos"): "Ethos",
+    normalize_token("Ethos Insurance"): "Ethos",
+    normalize_token("The Home Depot"): "The Home Depot",
+    normalize_token("Home Depot"): "The Home Depot",
+    normalize_token("Easy Cater"): "Easy Cater",
+    normalize_token("EasyCater"): "Easy Cater",
+    normalize_token("ezCater"): "Easy Cater",
+    normalize_token("SelectQuote"): "SelectQuote",
+    normalize_token("Select Quote"): "SelectQuote",
 }
 
 

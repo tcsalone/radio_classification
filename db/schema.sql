@@ -1,4 +1,4 @@
--- radio-classifier — schema v3
+-- radio-classifier — schema v4
 -- Five-class broadcast events with brand attribution, song fingerprinting,
 -- text-derived commercial identity, and capture-run provenance.
 PRAGMA foreign_keys = ON;
@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '3');
+INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', '4');
 
 CREATE TABLE IF NOT EXISTS brands (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS songs (
     source TEXT NOT NULL DEFAULT 'audfprint'
         CHECK (source IN ('audfprint', 'shazam', 'manual')),
     first_seen_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    release_date TEXT,
     UNIQUE (artist, title, source)
 );
 

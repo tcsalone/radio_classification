@@ -417,6 +417,13 @@ class BroadcastStore:
         self._conn.commit()
         return int(cur.lastrowid or 0)
 
+    def set_song_release_date(self, song_id: int, release_date: str | None) -> None:
+        """Persist a MusicBrainz-derived ``YYYY-MM-DD`` on a song row."""
+        self._conn.execute(
+            "UPDATE songs SET release_date = ? WHERE id = ?",
+            (release_date, song_id),
+        )
+
     # ------------------------------------------------------------ commercials
     def find_commercials_for_brand(
         self,
@@ -490,11 +497,26 @@ class BroadcastStore:
         """
 
         version = self.schema_version()
-        if version in (None, "3"):
+        if version == "2":
+            self._migrate_v2_to_v3()
+            version = self.schema_version()
+        if version in (None, "3", "4"):
+            self._migrate_v3_to_v4()
             return
-        if version != "2":
-            raise RuntimeError(f"unsupported broadcast store schema version: {version}")
-        self._migrate_v2_to_v3()
+        raise RuntimeError(f"unsupported broadcast store schema version: {version}")
+
+    def _migrate_v3_to_v4(self) -> None:
+        """Add optional MusicBrainz-derived release dates on ``songs`` rows."""
+        # Some old tests/fixtures (and potentially hand-built legacy DBs) have
+        # schema_meta but not every table from the current schema. Replaying the
+        # idempotent schema first creates any missing tables before ALTERs run.
+        schema_sql = self._schema_path.read_text(encoding="utf-8")
+        self._conn.executescript(schema_sql)
+        if "release_date" not in self._table_columns("songs"):
+            self._conn.execute("ALTER TABLE songs ADD COLUMN release_date TEXT")
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '4')"
+        )
 
     def _migrate_v2_to_v3(self) -> None:
         self._conn.execute(

@@ -40,7 +40,31 @@ Verify recent capture runs:
 
 ## Starting Capture
 
-Start the foreground supervisor from the repository root:
+For a bounded long capture where the target is **actual captured audio**, use
+the resilient wrapper from the repository root:
+
+```bash
+./scripts/capture_until_audio_hours.sh 20
+```
+
+This is the preferred overnight workflow. It appends to
+`data/store/broadcast.db`, opens a fresh `capture_runs` row for each capture
+iteration, and sums the sidecar `duration_seconds` values. If `rtl_fm` or the
+USB/IP dongle stream drops early, the partial chunk is classified, the next
+iteration starts after a short backoff, and the wrapper keeps going until the
+requested number of audio hours has been captured.
+
+Useful overrides:
+
+```bash
+DB_PATH=data/store/broadcast.db \
+BLOCK_SECONDS=1800 \
+RESTART_BACKOFF_SECONDS=30 \
+RETENTION_DAYS=7 \
+./scripts/capture_until_audio_hours.sh 20
+```
+
+For an unbounded foreground supervisor, use:
 
 ```bash
 ./scripts/capture_forever.sh
@@ -68,7 +92,8 @@ RETENTION_DAYS=7 \
 
 `capture_forever.sh` runs in the foreground by design. It restarts a failed
 capture/classify iteration after the configured backoff and opens a fresh
-`capture_runs` row for the next iteration.
+`capture_runs` row for the next iteration. It is intentionally unbounded; use
+`capture_until_audio_hours.sh` when you want a specific amount of audio.
 
 ## Stopping Capture
 
@@ -96,7 +121,8 @@ List recent run ids with:
 
 ## One-Off Runs
 
-Use `continuous_capture_blocks.sh` directly for bounded experiments:
+Use `continuous_capture_blocks.sh` directly for bounded experiments where a
+single `rtl_fm` stream is acceptable and no restart-on-drop behavior is needed:
 
 ```bash
 ./scripts/continuous_capture_blocks.sh 4
@@ -110,7 +136,9 @@ bounded run into the long-term store:
 ```
 
 The script refuses to reuse an existing run artifact path unless append mode is
-explicitly requested, which prevents accidentally mixing two unrelated runs.
+explicitly requested, which prevents accidentally mixing two unrelated runs. For
+overnight collection, prefer `capture_until_audio_hours.sh` so a transient USB/IP
+drop does not silently shorten the requested audio duration.
 
 ## Backups
 
@@ -176,3 +204,100 @@ Capture-run provenance:
 ```bash
 .venv/bin/python -m radio_classifier report runs --since 7d
 ```
+
+## LLM / Tier 3 (GPU Ollama)
+
+Tier 3 classification and the optional commercial brand backfill (`--llm`) call
+a local Ollama server. **Do not use the snap-packaged Ollama for this** — snap
+confinement cannot reach the WSL2 CUDA driver, so it silently runs the model
+100% on CPU (~40s per call, observed 2026-06-02). The native binary uses the
+RTX 2080 Ti and drops that to ~1–1.5s per call.
+
+Native GPU Ollama runs on port **11435** (the idle snap stays on 11434):
+
+```bash
+# One-time install (no sudo): native binary + bundled CUDA libs in ~/.local/ollama
+# (download ollama-linux-amd64.tar.zst from github.com/ollama/ollama/releases,
+#  decompress with `python -c "import zstandard,sys; ..."`, untar into ~/.local/ollama)
+
+# Start the GPU server (background) and pull the model once:
+OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama serve > /tmp/ollama_native.log 2>&1 &
+OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama pull llama3.2:latest
+
+# Verify GPU placement (PROCESSOR must read "100% GPU", not "100% CPU"):
+OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama ps
+```
+
+Point the classifier at the GPU instance via the env var:
+
+```bash
+export RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11435
+```
+
+## Commercial Brand Backfill
+
+COMMERCIAL events the funnel could not attribute to a brand land in the
+dashboard's "Unbranded / unidentified" bucket. `commercials backfill-brands`
+recovers brands from the stored transcript in two tiers:
+
+1. **Deterministic** (default, offline, high precision): a known-phrase table +
+   curated URL/domain map. This is the reliable win — it never mints junk brand
+   names that would fragment existing advertisers.
+2. **`--llm`** (optional): re-classifies the transcript text with the GPU Ollama
+   above for events the deterministic pass missed. Lower yield on short
+   fragments (text-only re-classification of ad tails/disclaimers is weak), so
+   treat it as a bonus, not the primary recovery path.
+
+```bash
+# Preview (read-only) over the whole DB:
+.venv/bin/python -m radio_classifier commercials backfill-brands \
+  --db-path data/store/broadcast.db --dry-run
+
+# Apply the deterministic pass (back up the DB first):
+cp data/store/broadcast.db data/store/broadcast.db.bak_$(date -u +%Y%m%dT%H%M%SZ)
+.venv/bin/python -m radio_classifier commercials backfill-brands \
+  --db-path data/store/broadcast.db --apply
+
+# Optional LLM tier (needs GPU Ollama on 11435):
+RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11435 \
+  .venv/bin/python -m radio_classifier commercials backfill-brands \
+  --db-path data/store/broadcast.db --llm --apply
+```
+
+Re-running is idempotent (only events still missing a brand are processed).
+
+### Boundary merge (overlapping-window orphans)
+
+The biggest source of unbranded commercials is *window overlap*: one ad lands
+across consecutive events, the LLM extracts the brand on one window but returns
+`null` on the heavily-overlapping neighbor, leaving an orphan fragment.
+`commercials merge-boundaries` attributes each unbranded COMMERCIAL fragment to
+its adjacent branded-commercial neighbor when their transcripts are similar
+enough to be the same ad.
+
+The `--min-similarity` gate (default `0.55`) is the safety mechanism: true
+same-ad overlaps cluster at ≥0.55, while straddle/pod-boundary cases (the
+fragment is a *different* ad than the neighbor's label) fall in the
+low-similarity tail and are rejected. The pass picks the highest-similarity
+branded neighbor, so a straddle fragment attaches to the ad it actually
+overlaps most.
+
+```bash
+# Preview (read-only):
+.venv/bin/python -m radio_classifier commercials merge-boundaries \
+  --db-path data/store/broadcast.db --dry-run
+
+# Apply (back up first):
+cp data/store/broadcast.db data/store/broadcast.db.bak_$(date -u +%Y%m%dT%H%M%SZ)
+.venv/bin/python -m radio_classifier commercials merge-boundaries \
+  --db-path data/store/broadcast.db --apply
+
+# Tune precision/recall (higher = safer, lower recall):
+.venv/bin/python -m radio_classifier commercials merge-boundaries \
+  --db-path data/store/broadcast.db --min-similarity 0.60 --dry-run
+```
+
+On the 2026-06-02 run this recovered 108 of 204 unbranded fragments (204 → 96).
+Going forward the `SegmentReducer` applies the same relaxed-identity absorb at
+capture time (`unbranded_absorb_similarity_threshold`, default `0.55`), so new
+captures should produce far fewer orphans. Re-running is idempotent.

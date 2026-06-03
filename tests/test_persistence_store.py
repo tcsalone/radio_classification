@@ -60,15 +60,20 @@ def _create_minimal_v2_db(db: Path) -> None:
         )
 
 
-def test_store_creates_schema_v3(tmp_path: Path) -> None:
+def test_store_creates_schema_v4(tmp_path: Path) -> None:
     db = tmp_path / "rc.db"
     with BroadcastStore(db) as store:
-        assert store.schema_version() == "3"
+        assert store.schema_version() == "4"
         columns = {
             row[1]
             for row in store.connection.execute("PRAGMA table_info(broadcast_events)").fetchall()
         }
         assert "capture_run_id" in columns
+        song_columns = {
+            row[1]
+            for row in store.connection.execute("PRAGMA table_info(songs)").fetchall()
+        }
+        assert "release_date" in song_columns
         assert store.connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'capture_runs'"
         ).fetchone()[0] == 1
@@ -81,17 +86,22 @@ def test_store_creates_schema_v3(tmp_path: Path) -> None:
             )
 
 
-def test_store_migrates_v2_to_v3_and_backfills_legacy_run(tmp_path: Path) -> None:
+def test_store_migrates_v2_to_v4_and_backfills_legacy_run(tmp_path: Path) -> None:
     db = tmp_path / "rc.db"
     _create_minimal_v2_db(db)
 
     with BroadcastStore(db) as store:
-        assert store.schema_version() == "3"
+        assert store.schema_version() == "4"
         columns = {
             row[1]
             for row in store.connection.execute("PRAGMA table_info(broadcast_events)").fetchall()
         }
         assert "capture_run_id" in columns
+        song_columns = {
+            row[1]
+            for row in store.connection.execute("PRAGMA table_info(songs)").fetchall()
+        }
+        assert "release_date" in song_columns
 
         run = store.connection.execute(
             """
@@ -112,7 +122,7 @@ def test_store_migrates_v2_to_v3_and_backfills_legacy_run(tmp_path: Path) -> Non
 
     # Reopening should be idempotent: no duplicate capture_run rows, no errors.
     with BroadcastStore(db) as store:
-        assert store.schema_version() == "3"
+        assert store.schema_version() == "4"
         assert store.connection.execute("SELECT COUNT(*) FROM capture_runs").fetchone()[0] == 1
         assert store.connection.execute("SELECT COUNT(*) FROM broadcast_events").fetchone()[0] == 2
 

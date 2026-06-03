@@ -47,3 +47,15 @@ def test_canonicalize_brand_keeps_existing_alias_entries_working() -> None:
     assert canonicalize_brand("Habes Law") == "Habas Law"
     assert canonicalize_brand("Wokfire") == "Wokfire"
     assert canonicalize_brand("WOC Fire") == "Wokfire"
+
+
+def test_canonicalize_brand_folds_2026_06_02_naming_variants() -> None:
+    """Same-advertiser spelling variants from the 20h run fold to one form."""
+    assert canonicalize_brand("Ethos Insurance") == "Ethos"
+    assert canonicalize_brand("Ethos") == "Ethos"
+    assert canonicalize_brand("Home Depot") == "The Home Depot"
+    assert canonicalize_brand("The Home Depot") == "The Home Depot"
+    assert canonicalize_brand("EasyCater") == "Easy Cater"
+    assert canonicalize_brand("Easy Cater") == "Easy Cater"
+    assert canonicalize_brand("Select Quote") == "SelectQuote"
+    assert canonicalize_brand("SelectQuote") == "SelectQuote"

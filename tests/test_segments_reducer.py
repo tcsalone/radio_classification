@@ -213,6 +213,73 @@ def test_adjacent_commercial_windows_same_brand_different_transcript_stay_separa
     ]
 
 
+def _unbranded_commercial(seconds: int, *, transcript: str) -> SegmentInput:
+    return SegmentInput(
+        _ts(seconds),
+        SegmentKey(BroadcastCategory.COMMERCIAL),
+        brand_name=None,
+        transcript_excerpt=transcript,
+        confidence=0.6,
+    )
+
+
+def test_unbranded_fragment_absorbed_into_branded_neighbor_when_similar() -> None:
+    r = SegmentReducer()
+    out = []
+    out.extend(
+        r.feed(
+            _commercial(
+                0,
+                commercial_id=11,
+                transcript="Now through June fifteenth get gig wifi for fifty a month for five years no strings",
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            _unbranded_commercial(
+                10,
+                transcript="get gig wifi for fifty a month for five years no strings no commitment included",
+            )
+        )
+    )
+    out.extend(r.feed(_dj(20)))
+
+    assert len(out) == 1
+    assert out[0].brand_name == "Toyota"  # _commercial default brand
+    assert out[0].commercial_id == 11
+    assert out[0].timestamp_start == _ts(0)
+    assert out[0].timestamp_end == _ts(20)
+
+
+def test_unbranded_fragment_not_absorbed_when_dissimilar_straddle() -> None:
+    r = SegmentReducer()
+    out = []
+    out.extend(
+        r.feed(
+            _commercial(
+                0,
+                commercial_id=11,
+                transcript="taxes and fees apply see t mobile dot com unlimited plan for the whole family",
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            _unbranded_commercial(
+                10,
+                transcript="get ready for summer with exciting styles during the living spaces memorial day event",
+            )
+        )
+    )
+    out.extend(r.finalize(_ts(10), 10.0))
+
+    assert [(t.category, t.brand_name, t.timestamp_start) for t in out] == [
+        (BroadcastCategory.COMMERCIAL, "Toyota", _ts(0)),
+        (BroadcastCategory.COMMERCIAL, None, _ts(10)),
+    ]
+
+
 def test_unknown_song_bridge_merges_into_bracketing_song() -> None:
     r = SegmentReducer()
     out = []

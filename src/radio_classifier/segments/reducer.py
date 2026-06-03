@@ -54,6 +54,7 @@ class SegmentReducer:
         max_unknown_song_bridge_seconds: float = 60.0,
         adjacent_commercial_similarity_threshold: float = 0.35,
         max_adjacent_commercial_combined_seconds: float = 90.0,
+        unbranded_absorb_similarity_threshold: float = 0.55,
     ) -> None:
         self.max_unknown_song_bridge_seconds = max(0.0, max_unknown_song_bridge_seconds)
         self.adjacent_commercial_similarity_threshold = max(
@@ -63,6 +64,17 @@ class SegmentReducer:
         self.max_adjacent_commercial_combined_seconds = max(
             0.0,
             max_adjacent_commercial_combined_seconds,
+        )
+        # When one of two adjacent commercial windows carries a brand and the
+        # other does not (the LLM commonly returns null on a heavily-overlapping
+        # window of the same ad), they have *different* identities and would not
+        # merge on the brand-equality path. Absorb the unbranded side into the
+        # branded one when transcripts are this similar — the higher bar than
+        # ``adjacent_commercial_similarity_threshold`` guards against straddle
+        # windows that span two different ads. Set to 0 to disable.
+        self.unbranded_absorb_similarity_threshold = max(
+            0.0,
+            unbranded_absorb_similarity_threshold,
         )
         self._current_key: SegmentKey | None = None
         self._current_start_utc: str | None = None
@@ -264,19 +276,30 @@ class SegmentReducer:
         current_duration = duration_seconds(self._current_start_utc, inp.window_start_utc)
         if current_duration > self.max_adjacent_commercial_combined_seconds:
             return False
-        if _commercial_brand_identity(self._current_key, self._brand) != _commercial_brand_identity(
-            inp.key,
-            inp.brand_name,
-        ):
+        similarity = text_similarity(self._transcript or "", inp.transcript_excerpt or "")
+        current_identity = _commercial_brand_identity(self._current_key, self._brand)
+        incoming_identity = _commercial_brand_identity(inp.key, inp.brand_name)
+        if current_identity == incoming_identity:
+            return similarity >= self.adjacent_commercial_similarity_threshold
+        # Different identities: only absorb when exactly one side is unbranded
+        # (empty identity) and the transcripts are very similar — the same ad
+        # split across an overlapping window where the LLM dropped the brand.
+        if self.unbranded_absorb_similarity_threshold <= 0:
             return False
-        return (
-            text_similarity(self._transcript or "", inp.transcript_excerpt or "")
-            >= self.adjacent_commercial_similarity_threshold
-        )
+        one_side_unbranded = (current_identity == "") != (incoming_identity == "")
+        if not one_side_unbranded:
+            return False
+        return similarity >= self.unbranded_absorb_similarity_threshold
 
     def _merge_commercial_identity(self, inp: SegmentInput) -> None:
         assert self._current_key is not None
-        if self._current_key.commercial_id is None and inp.key.commercial_id is not None:
+        current_identity = _commercial_brand_identity(self._current_key, self._brand)
+        incoming_identity = _commercial_brand_identity(inp.key, inp.brand_name)
+        # Adopt the branded identity when the current segment is unbranded and
+        # the incoming window carries a brand (overlapping-window orphan).
+        if current_identity == "" and incoming_identity != "":
+            self._current_key = inp.key
+        elif self._current_key.commercial_id is None and inp.key.commercial_id is not None:
             self._current_key = inp.key
 
 
