@@ -524,6 +524,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "songs-added",
         "songs-timeline",
         "artists",
+        "artist-plays",
         "timeline",
         "summary",
         "dashboard",
@@ -534,6 +535,11 @@ def _build_parser() -> argparse.ArgumentParser:
             help_text = (
                 "Per-artist airtime rollup (case-folded dedup, spins, distinct "
                 "titles, total airtime)"
+            )
+        elif name == "artist-plays":
+            help_text = (
+                "Write a static HTML play log: every song play for the top N "
+                "artists, grouped per artist (default top 3)"
             )
         elif name == "songs-timeline":
             help_text = "Chronological SONG-only listening log"
@@ -548,7 +554,8 @@ def _build_parser() -> argparse.ArgumentParser:
         r.add_argument("--since", type=str, default=None, help="Window start as duration/ISO (default: 24h)")
         r.add_argument("--from", dest="from_utc", type=str, default=None, help="Explicit inclusive UTC window start")
         r.add_argument("--to", dest="until_utc", type=str, default=None, help="Explicit exclusive UTC window end")
-        r.add_argument("--top", type=int, default=10, help="Limit (default 10)")
+        default_top = 3 if name == "artist-plays" else 10
+        r.add_argument("--top", type=int, default=default_top, help=f"Limit (default {default_top})")
         if name == "commercials":
             r.add_argument("--brand", type=str, default=None, help="Filter to a single brand")
         if name == "songs-added":
@@ -561,12 +568,13 @@ def _build_parser() -> argparse.ArgumentParser:
             )
         if name in {"timeline", "songs-timeline"}:
             r.add_argument("--limit", type=int, default=500)
-        if name == "dashboard":
+        if name in {"dashboard", "artist-plays"}:
+            default_out = "dashboard.html" if name == "dashboard" else "artist-plays.html"
             r.add_argument(
                 "--out",
                 type=Path,
                 default=None,
-                help="Output HTML path (default: data/reports/dashboard.html)",
+                help=f"Output HTML path (default: data/reports/{default_out})",
             )
 
     # ---- seed
@@ -1830,6 +1838,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         songs_top,
         summary,
         timeline,
+        write_artist_plays,
         write_dashboard,
     )
 
@@ -1869,6 +1878,16 @@ def cmd_report(args: argparse.Namespace) -> int:
         elif args.report_command == "artists":
             rows = artists_top(store, since_utc=since_utc, until_utc=until_utc, top_n=args.top)
             print(format_artists(rows))
+        elif args.report_command == "artist-plays":
+            out_path = args.out or (_project_root() / "data" / "reports" / "artist-plays.html")
+            written = write_artist_plays(
+                store,
+                since_utc=since_utc,
+                until_utc=until_utc,
+                out_path=out_path,
+                top_n=args.top,
+            )
+            print(f"radio-classifier: wrote artist play log to {written}")
         elif args.report_command == "timeline":
             rows = timeline(store, since_utc=since_utc, until_utc=until_utc, limit=args.limit)
             print(format_timeline(rows))

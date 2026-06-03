@@ -741,6 +741,186 @@ def artists_top(
     return rows[: max(0, int(top_n))]
 
 
+@dataclass
+class ArtistPlay:
+    """One collapsed play of a song by a given artist, with its start time."""
+
+    title: str | None
+    start_utc: str
+    end_utc: str | None
+    duration_seconds: float
+    segment_count: int
+    is_promo: bool
+
+
+@dataclass
+class ArtistPlaylog:
+    """Every play for one artist, in chronological order.
+
+    ``rank`` is the artist's position in :func:`artists_top` (0-based), so the
+    first entry is the #1 artist for the window.
+    """
+
+    artist: str
+    rank: int
+    total_plays: int
+    distinct_titles: int
+    plays: list[ArtistPlay]
+
+
+def _collapse_plays(
+    segments: list[tuple[str, str | None, float | None]],
+    gap_seconds: float,
+    *,
+    promo_max_spin_seconds: float = PROMO_MAX_SPIN_SECONDS,
+) -> list[ArtistPlay]:
+    """Collapse one title's segments into individual plays (with timestamps).
+
+    Mirrors :func:`_count_spins` (same gap-based merge and overlap handling)
+    but, instead of returning only tallies, emits one :class:`ArtistPlay` per
+    completed play so callers can build a chronological log. Plays with no
+    positive airtime are dropped, matching the spin count.
+    """
+    ordered = sorted(segments, key=lambda s: s[0])
+    plays: list[ArtistPlay] = []
+    cur_start: str | None = None
+    cur_end: str | None = None
+    cur_duration = 0.0
+    cur_segments = 0
+    prev_end_iso: str | None = None
+
+    def _close() -> None:
+        if cur_start is None or cur_duration <= 0:
+            return
+        plays.append(
+            ArtistPlay(
+                title=None,
+                start_utc=cur_start,
+                end_utc=cur_end,
+                duration_seconds=cur_duration,
+                segment_count=cur_segments,
+                is_promo=cur_duration < promo_max_spin_seconds,
+            )
+        )
+
+    for start_iso, end_iso, dur in ordered:
+        dur_f = float(dur or 0.0)
+        if prev_end_iso is None or _gap_seconds(prev_end_iso, start_iso) > gap_seconds:
+            _close()
+            cur_start = start_iso
+            cur_end = end_iso
+            cur_duration = dur_f
+            cur_segments = 1
+        else:
+            cur_duration += dur_f
+            cur_segments += 1
+            if end_iso is not None:
+                cur_end = end_iso
+        if end_iso is not None:
+            prev_end_iso = end_iso
+        elif dur_f > 0:
+            prev_end_iso = _iso(_parse_iso_utc(start_iso) + timedelta(seconds=dur_f))
+        else:
+            prev_end_iso = start_iso
+    _close()
+    return plays
+
+
+def top_artist_playlogs(
+    store: BroadcastStore,
+    *,
+    since_utc: str,
+    until_utc: str | None = None,
+    top_n: int = 3,
+    spin_merge_gap_seconds: float | None = None,
+) -> list[ArtistPlaylog]:
+    """Chronological per-play log for each of the top ``top_n`` artists.
+
+    The artists (and their ordering) are exactly those returned by
+    :func:`artists_top`, so this is the "drill-down" companion to the Top
+    Artists rollup: every play of every title, with timestamps, grouped by
+    artist. Plays reuse the same gap-merge semantics as spins, so overlapping
+    detection windows for a single airing collapse into one entry.
+    """
+    gap = SPIN_MERGE_GAP_SECONDS if spin_merge_gap_seconds is None else float(spin_merge_gap_seconds)
+    top = artists_top(
+        store,
+        since_utc=since_utc,
+        until_utc=until_utc,
+        top_n=top_n,
+        spin_merge_gap_seconds=spin_merge_gap_seconds,
+    )
+    if not top:
+        return []
+
+    key_to_rank: dict[str, int] = {}
+    key_to_display: dict[str, str] = {}
+    for rank, artist_row in enumerate(top):
+        key = _artist_dedupe_key(artist_row.artist)
+        key_to_rank[key] = rank
+        key_to_display[key] = artist_row.artist
+
+    window_clause, args = _window_clause("e.timestamp_start", since_utc, until_utc)
+    raw = store.connection.execute(
+        """
+        SELECT
+            e.song_id AS song_id,
+            COALESCE(s.artist, e.artist) AS artist,
+            COALESCE(s.title, e.track_title) AS title,
+            e.timestamp_start,
+            e.timestamp_end,
+            e.duration
+        FROM broadcast_events e
+        LEFT JOIN songs s ON e.song_id = s.id
+        WHERE e.category = 'SONG' AND {window_clause}
+        ORDER BY e.timestamp_start ASC
+        """.format(window_clause=window_clause),
+        args,
+    ).fetchall()
+
+    # Per artist key -> per title key -> {display title, segments}.
+    per_key: dict[str, dict[tuple[int | None, str], dict]] = {}
+    for song_id, artist_raw, title_raw, start_iso, end_iso, dur in raw:
+        if artist_raw is None:
+            continue
+        artist_str = str(artist_raw).strip()
+        if not artist_str:
+            continue
+        key = _artist_dedupe_key(artist_str)
+        if key not in key_to_rank:
+            continue
+        title_display = str(title_raw).strip() if title_raw else None
+        if song_id is not None:
+            title_key: tuple[int | None, str] = (int(song_id), "")
+        else:
+            title_key = (None, title_display.casefold() if title_display else "")
+        titles = per_key.setdefault(key, {})
+        entry = titles.setdefault(title_key, {"title": title_display, "segments": []})
+        if entry["title"] is None and title_display:
+            entry["title"] = title_display
+        entry["segments"].append((start_iso, end_iso, dur))
+
+    logs: list[ArtistPlaylog] = []
+    for key in sorted(key_to_rank, key=lambda k: key_to_rank[k]):
+        titles = per_key.get(key, {})
+        plays: list[ArtistPlay] = []
+        for entry in titles.values():
+            for play in _collapse_plays(entry["segments"], gap):
+                play.title = entry["title"]
+                plays.append(play)
+        plays.sort(key=lambda p: p.start_utc)
+        logs.append(
+            ArtistPlaylog(
+                artist=key_to_display[key],
+                rank=key_to_rank[key],
+                total_plays=len(plays),
+                distinct_titles=len(titles),
+                plays=plays,
+            )
+        )
+    return logs
+
+
 def timeline(
     store: BroadcastStore,
     *,

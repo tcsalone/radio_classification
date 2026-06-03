@@ -1,5 +1,9 @@
 """CLI-only reporting: brands, commercials, songs, timeline, summary."""
 
+from radio_classifier.reports.artist_plays import (
+    render_artist_plays_html,
+    write_artist_plays,
+)
 from radio_classifier.reports.dashboard import render_dashboard_html, write_dashboard
 from radio_classifier.reports.format import (
     format_artists,
@@ -15,6 +19,8 @@ from radio_classifier.reports.format import (
 )
 from radio_classifier.reports.queries import (
     PROMO_MAX_SPIN_SECONDS,
+    ArtistPlay,
+    ArtistPlaylog,
     artists_top,
     brands_top,
     commercials_by_brand,
@@ -26,10 +32,13 @@ from radio_classifier.reports.queries import (
     songs_top,
     summary,
     timeline,
+    top_artist_playlogs,
 )
 
 __all__ = [
     "PROMO_MAX_SPIN_SECONDS",
+    "ArtistPlay",
+    "ArtistPlaylog",
     "artists_top",
     "brands_top",
     "commercials_by_brand",
@@ -45,6 +54,7 @@ __all__ = [
     "format_summary",
     "format_timeline",
     "parse_since",
+    "render_artist_plays_html",
     "render_dashboard_html",
     "runs_summary",
     "songs_added",
@@ -52,5 +62,7 @@ __all__ = [
     "songs_top",
     "summary",
     "timeline",
+    "top_artist_playlogs",
+    "write_artist_plays",
     "write_dashboard",
 ]

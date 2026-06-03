@@ -21,11 +21,13 @@ from radio_classifier.reports import (
     format_summary,
     format_timeline,
     parse_since,
+    render_artist_plays_html,
     render_dashboard_html,
     songs_timeline,
     songs_top,
     summary,
     timeline,
+    top_artist_playlogs,
 )
 from radio_classifier.segments.types import BroadcastCategory, SegmentTransition
 
@@ -809,6 +811,120 @@ def test_format_songs_and_artists_decorate_promo_only_entries(tmp_path: Path) ->
         assert "0 (+3)" in artist_out
         assert "[promo]" in artist_out
         assert "Julia Wolf" in artist_out
+    finally:
+        store.close()
+
+
+def _seed_three_artists(tmp_path: Path) -> BroadcastStore:
+    """Three artists with differing spin counts: RHCP > Green Day > Linkin Park."""
+    store = BroadcastStore(tmp_path / "playlog.db")
+    base = datetime.now(tz=timezone.utc) - timedelta(hours=6)
+
+    def _put(start: datetime, dur: int, *, artist: str, title: str, song_id: int | None) -> None:
+        store.apply_transition(
+            SegmentTransition(
+                timestamp_start=_iso(start),
+                timestamp_end=_iso(start + timedelta(seconds=dur)),
+                category=BroadcastCategory.SONG,
+                artist=artist,
+                track_title=title,
+                song_id=song_id,
+            )
+        )
+
+    rhcp_a = store.upsert_song(artist="Red Hot Chili Peppers", title="Californication")
+    rhcp_b = store.upsert_song(artist="Red Hot Chili Peppers", title="Otherside")
+    gd = store.upsert_song(artist="Green Day", title="Basket Case")
+    lp = store.upsert_song(artist="Linkin Park", title="Numb")
+
+    # RHCP: 3 full plays across 2 titles.
+    _put(base, 200, artist="Red Hot Chili Peppers", title="Californication", song_id=rhcp_a)
+    _put(base + timedelta(minutes=30), 200, artist="Red Hot Chili Peppers", title="Otherside", song_id=rhcp_b)
+    _put(base + timedelta(minutes=90), 200, artist="Red Hot Chili Peppers", title="Californication", song_id=rhcp_a)
+    # Green Day: 2 full plays of one title.
+    _put(base + timedelta(minutes=20), 180, artist="Green Day", title="Basket Case", song_id=gd)
+    _put(base + timedelta(minutes=120), 180, artist="Green Day", title="Basket Case", song_id=gd)
+    # Linkin Park: 1 full play.
+    _put(base + timedelta(minutes=45), 185, artist="Linkin Park", title="Numb", song_id=lp)
+    return store
+
+
+def test_top_artist_playlogs_groups_plays_per_artist_in_order(tmp_path: Path) -> None:
+    store = _seed_three_artists(tmp_path)
+    try:
+        logs = top_artist_playlogs(store, since_utc=parse_since("1d"), top_n=3)
+        assert [log.artist for log in logs] == [
+            "Red Hot Chili Peppers",
+            "Green Day",
+            "Linkin Park",
+        ]
+        assert [log.rank for log in logs] == [0, 1, 2]
+
+        rhcp = logs[0]
+        assert rhcp.total_plays == 3
+        assert rhcp.distinct_titles == 2
+        # Plays are chronological.
+        starts = [p.start_utc for p in rhcp.plays]
+        assert starts == sorted(starts)
+        assert {p.title for p in rhcp.plays} == {"Californication", "Otherside"}
+        assert all(p.is_promo is False for p in rhcp.plays)
+
+        assert logs[1].total_plays == 2
+        assert logs[2].total_plays == 1
+    finally:
+        store.close()
+
+
+def test_top_artist_playlogs_respects_top_n(tmp_path: Path) -> None:
+    store = _seed_three_artists(tmp_path)
+    try:
+        logs = top_artist_playlogs(store, since_utc=parse_since("1d"), top_n=2)
+        assert [log.artist for log in logs] == ["Red Hot Chili Peppers", "Green Day"]
+    finally:
+        store.close()
+
+
+def test_top_artist_playlogs_collapses_overlapping_windows_into_one_play(tmp_path: Path) -> None:
+    """Overlapping detection windows for one airing collapse to a single play."""
+    store = BroadcastStore(tmp_path / "overlap.db")
+    try:
+        song = store.upsert_song(artist="Muse", title="Hysteria")
+        base = datetime.now(tz=timezone.utc) - timedelta(hours=1)
+        # Three overlapping 90s windows stepping 30s apart — one real play.
+        for step in range(3):
+            start = base + timedelta(seconds=30 * step)
+            store.apply_transition(
+                SegmentTransition(
+                    timestamp_start=_iso(start),
+                    timestamp_end=_iso(start + timedelta(seconds=90)),
+                    category=BroadcastCategory.SONG,
+                    artist="Muse",
+                    track_title="Hysteria",
+                    song_id=song,
+                )
+            )
+        logs = top_artist_playlogs(store, since_utc=parse_since("1d"), top_n=3)
+        assert len(logs) == 1
+        assert logs[0].total_plays == 1
+        assert logs[0].plays[0].segment_count == 3
+    finally:
+        store.close()
+
+
+def test_render_artist_plays_html_has_sections_and_theme(tmp_path: Path) -> None:
+    store = _seed_three_artists(tmp_path)
+    try:
+        html = render_artist_plays_html(store, since_utc=parse_since("1d"), top_n=3)
+        assert "<!doctype html>" in html
+        assert "Top Artist Play Log" in html
+        # Reuses the dashboard theme tokens.
+        assert "--panel" in html
+        assert 'class="rank-pill"' in html
+        # Each artist appears as its own section, in order.
+        assert html.index("Red Hot Chili Peppers") < html.index("Green Day") < html.index("Linkin Park")
+        assert "Californication" in html
+        assert "Numb" in html
+        assert "When (UTC)" in html
     finally:
         store.close()
 
