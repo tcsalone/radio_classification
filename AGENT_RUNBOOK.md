@@ -120,7 +120,105 @@ sqlite3 data/store/broadcast.db "PRAGMA integrity_check;"
   not start another**.
 - P5: prints `ok`. If not → escalate (§9 trigger E1).
 
-### 3.1 Start a capture (preferred: bounded by audio hours)
+### 3.1 Post-reboot startup sequence (Ollama + RTL binding)
+
+Run this whenever Windows/WSL was rebooted, WSL was shut down, or `rtl_test`
+reports `No supported devices found`. It is safe to run before every capture.
+
+#### 3.1.1 Start native GPU Ollama on port 11435
+
+```bash
+cd /home/eamon/dev/radio-classifier
+
+# Start the native GPU Ollama server if it is not already reachable.
+if ! OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama ps >/dev/null 2>&1; then
+  OLLAMA_HOST=127.0.0.1:11435 \
+    ~/.local/ollama/bin/ollama serve > /tmp/ollama_native.log 2>&1 &
+  sleep 2
+fi
+
+# Expected: either an empty table (cold model) or llama3.2 with PROCESSOR=100% GPU.
+OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama ps
+
+export RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11435
+export RADIO_CLASSIFIER_OLLAMA_KEEP_ALIVE=-1
+```
+
+**Rule:** if `ollama ps` errors after the start attempt, inspect
+`/tmp/ollama_native.log`. If it lists the model as `100% CPU` after a real
+classification call, stop and escalate (E5). The snap instance on port 11434 is
+not acceptable for capture runs.
+
+#### 3.1.2 Bind the NESDR RTL dongle into WSL
+
+After reboot the device may be shared in Windows but not attached to the running
+WSL distro. First inspect Windows' usbipd state:
+
+```bash
+powershell.exe -NoProfile -Command "usbipd list"
+```
+
+Known-good device from this host:
+
+```text
+BUSID  VID:PID    DEVICE
+5-3    0bda:2838  NESDR SMArt v5
+```
+
+If the `NESDR SMArt v5` row is `Shared` or `Not attached`, attach it:
+
+```bash
+powershell.exe -NoProfile -Command "usbipd attach --wsl --busid 5-3"
+
+# Give the WSL USB/IP bus a moment to enumerate.
+sleep 5
+lsusb
+timeout 15 rtl_test -t
+```
+
+**Pass criteria:** `lsusb` shows `0bda:2838 Realtek Semiconductor Corp. RTL2838
+DVB-T`, and `rtl_test -t` prints:
+
+```text
+Found 1 device(s):
+  0:  Nooelec, NESDR SMArt v5, SN: ...
+Found Rafael Micro R820T tuner
+```
+
+`rtl_test -t` may then end with `No E4000 tuner found, aborting.` That is OK on
+this stick because it uses an **R820T** tuner, not E4000.
+
+If `usbipd list` shows the device as `Not shared`, an elevated Windows shell is
+needed once:
+
+```powershell
+usbipd bind --busid 5-3
+```
+
+Then retry the non-admin attach command above from WSL. If attach reports
+success but `lsusb` still shows only root hubs, wait 5 seconds and re-run
+`lsusb`/`rtl_test`; enumeration can lag behind the `usbipd` state. If it still
+fails, escalate (E3/E2 depending on whether capture is blocked or produces no
+audio).
+
+#### 3.1.3 Short RTL audio smoke test
+
+Before a long run, take a tiny sample from the station frequency:
+
+```bash
+timeout 8 bash -c \
+  'rtl_fm -f 105300000 -M wbfm -s 48000 -r 48000 - 2>/tmp/rtl_fm_smoke.err \
+   | dd bs=4096 count=4 of=/dev/null status=none'
+echo "rtl_fm_rc=$?"
+sed -n '1,12p' /tmp/rtl_fm_smoke.err
+```
+
+**Pass criteria:** stderr shows the Nooelec device, the R820T tuner, and normal
+tuning/sample-rate lines. A nonzero exit, `No supported devices found`, or no
+device/tuner lines means do not start the capture; rerun §3.1.2 or escalate if
+it persists.
+
+### 3.2 Start a capture (preferred: bounded by audio hours)
 
 ```bash
 # 20 audio-hours into the long-term DB, resilient to USB/IP drops.
@@ -138,7 +236,7 @@ DB_PATH=data/store/broadcast.db BLOCK_SECONDS=1800 RETENTION_DAYS=7 \
   ./scripts/capture_until_audio_hours.sh 20
 ```
 
-### 3.2 Monitor during the run (every 30–60 min)
+### 3.3 Monitor during the run (every 30–60 min)
 
 ```bash
 # M1: is the supervisor still alive?
@@ -161,7 +259,7 @@ OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama ps
 ```
 
 **Monitor rules:**
-- M1 empty + capture target not reached → supervisor died. Re-run §3.1 once; it
+- M1 empty + capture target not reached → supervisor died. Re-run §3.2 once; it
   resumes from captured audio. If it dies again within 10 min → escalate (E3).
 - M3: if `SONG` count is **0** over 2h while the radio is on → Tier 1/2 likely
   broken or dongle is silent → escalate (E2).
