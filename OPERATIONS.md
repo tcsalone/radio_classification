@@ -234,6 +234,30 @@ Point the classifier at the GPU instance via the env var:
 export RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11435
 ```
 
+### Keep the model resident (HDD/VMMEM fix)
+
+Ollama unloads an idle model after **5 minutes** by default. On a long capture
+run the model therefore unloads between blocks and reloads (hundreds of MB) when
+the next block's Tier-3 work starts. On this host that reload churn pushed the
+RAM-starved WSL2 VM into swap and pegged the Windows HDD 0 via `vmmem`/`SYSTEM`
+(see `data/reports/hdd-vmmem-investigation-run4.md`).
+
+The classifier now sends `keep_alive` on every request, defaulting to **`-1`**
+(stay loaded indefinitely), so the model loads once and stays put. Override via:
+
+```bash
+# Default is -1 (resident forever). Examples:
+export RADIO_CLASSIFIER_OLLAMA_KEEP_ALIVE=-1     # pin resident (default)
+export RADIO_CLASSIFIER_OLLAMA_KEEP_ALIVE=30m    # unload after 30 min idle
+export RADIO_CLASSIFIER_OLLAMA_KEEP_ALIVE=0      # unload immediately (old churn)
+```
+
+Trade-off: a pinned model holds GPU/host RAM for the whole run. That's the
+intended behavior here — steady residency is far cheaper than repeated reloads.
+Confirm it stays loaded during a run with
+`OLLAMA_HOST=127.0.0.1:11435 ~/.local/ollama/bin/ollama ps` (the `UNTIL` column
+should read *Forever* / *4 ever* rather than a countdown).
+
 ## Commercial Brand Backfill
 
 COMMERCIAL events the funnel could not attribute to a brand land in the

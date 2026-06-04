@@ -35,6 +35,25 @@ def _default_model() -> str:
     )
 
 
+def _default_keep_alive() -> int | str:
+    """How long Ollama should keep the model resident between requests.
+
+    Ollama unloads idle models after 5 minutes by default, so long capture
+    runs reload the model (hundreds of MB) at every block boundary — the
+    reload churn that drives the WSL2 VM into swap and pegs the host's HDD.
+
+    Pinning the model resident eliminates that. The value is whatever Ollama's
+    ``keep_alive`` accepts: ``-1`` (or any negative int) keeps it loaded
+    indefinitely, ``0`` unloads immediately, a positive int is seconds, and a
+    duration string like ``"30m"`` also works. Default: ``-1`` (stay loaded).
+    """
+    raw = os.environ.get("RADIO_CLASSIFIER_OLLAMA_KEEP_ALIVE", "-1").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
 def _build_messages(text: str, include_fewshots: bool = True) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
     if include_fewshots:
@@ -55,12 +74,14 @@ class OllamaSpeechClassifier:
         model: str | None = None,
         include_fewshots: bool = True,
         request_timeout: float = 120.0,
+        keep_alive: int | str | None = None,
     ) -> None:
         raw = base_url if base_url is not None else _default_base_url()
         self.base_url = raw.rstrip("/")
         self.model = model if model is not None else _default_model()
         self.include_fewshots = include_fewshots
         self.request_timeout = request_timeout
+        self.keep_alive = keep_alive if keep_alive is not None else _default_keep_alive()
         self._cache: dict[str, LlmClassificationJson] = {}
 
     def classify_transcript(self, text: str) -> LlmClassificationJson:
@@ -98,6 +119,7 @@ class OllamaSpeechClassifier:
             "stream": False,
             "format": "json",
             "options": {"temperature": 0.1},
+            "keep_alive": self.keep_alive,
         }
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
