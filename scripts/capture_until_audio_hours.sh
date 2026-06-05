@@ -16,6 +16,11 @@ set -euo pipefail
 #   BLOCK_SECONDS=1800
 #   RESTART_BACKOFF_SECONDS=30
 #   RETENTION_DAYS=7
+#   MIN_TOPUP_SECONDS=120        # treat target as reached when the remaining
+#                                # sliver is this small (avoids 1s top-up blocks
+#                                # that cannot produce classifier windows)
+#   MAX_ZERO_PROGRESS_ITERS=3    # bail after this many consecutive iterations
+#                                # that capture no audio (e.g. dongle gone)
 #   FREQUENCY=105300000
 #   DEVICE_INDEX=0
 #   SAMPLE_RATE=48000
@@ -28,6 +33,14 @@ DB_PATH="${DB_PATH:-data/store/broadcast.db}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-1800}"
 RESTART_BACKOFF_SECONDS="${RESTART_BACKOFF_SECONDS:-30}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
+# Completion tolerance: once we are within this many seconds of the target we
+# stop, rather than spawning a tiny final block. A 1s top-up cannot yield a
+# classifier window, so the old behaviour was an infinite "no audio captured"
+# loop that also minted hundreds of empty capture_runs rows.
+MIN_TOPUP_SECONDS="${MIN_TOPUP_SECONDS:-120}"
+# Safety net: if the dongle dies near the end, consecutive iterations capture
+# nothing. Give up after this many in a row instead of looping forever.
+MAX_ZERO_PROGRESS_ITERS="${MAX_ZERO_PROGRESS_ITERS:-3}"
 
 mkdir -p data/logs
 
@@ -57,9 +70,12 @@ echo "capture_until_audio_hours: db=$DB_PATH"
 echo "capture_until_audio_hours: block_seconds=$BLOCK_SECONDS"
 echo "capture_until_audio_hours: restart_backoff_seconds=$RESTART_BACKOFF_SECONDS"
 echo "capture_until_audio_hours: retention_days=$RETENTION_DAYS"
+echo "capture_until_audio_hours: min_topup_seconds=$MIN_TOPUP_SECONDS"
+echo "capture_until_audio_hours: max_zero_progress_iters=$MAX_ZERO_PROGRESS_ITERS"
 
 captured_seconds=0
 iteration=0
+zero_progress_streak=0
 
 sidecar_duration_sum() {
   local run_dir="$1"
@@ -84,8 +100,16 @@ PY
 }
 
 while [[ "$captured_seconds" -lt "$TARGET_SECONDS" ]]; do
-  iteration=$((iteration + 1))
   remaining=$((TARGET_SECONDS - captured_seconds))
+
+  # Stop chasing a sub-block sliver. Only applies once we have made real
+  # progress, so a small test target (e.g. TARGET < MIN_TOPUP) still runs once.
+  if [[ "$captured_seconds" -gt 0 && "$remaining" -le "$MIN_TOPUP_SECONDS" ]]; then
+    echo "capture_until_audio_hours: within tolerance (remaining=${remaining}s <= ${MIN_TOPUP_SECONDS}s); treating target as reached"
+    break
+  fi
+
+  iteration=$((iteration + 1))
   blocks=$(((remaining + BLOCK_SECONDS - 1) / BLOCK_SECONDS))
   iter_block_seconds=$(((remaining + blocks - 1) / blocks))
   iter_log="data/logs/capture_until_${TARGET_HOURS}h_iter${iteration}_$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -122,8 +146,18 @@ while [[ "$captured_seconds" -lt "$TARGET_SECONDS" ]]; do
   echo "capture_until_audio_hours: captured_seconds=$captured_seconds/$TARGET_SECONDS"
 
   if [[ "$iteration_seconds" -le 0 ]]; then
-    echo "capture_until_audio_hours: no audio captured; sleeping ${RESTART_BACKOFF_SECONDS}s before retry" >&2
+    zero_progress_streak=$((zero_progress_streak + 1))
+    echo "capture_until_audio_hours: no audio captured (streak=${zero_progress_streak}/${MAX_ZERO_PROGRESS_ITERS})" >&2
+    if [[ "$zero_progress_streak" -ge "$MAX_ZERO_PROGRESS_ITERS" ]]; then
+      echo "capture_until_audio_hours: giving up after ${zero_progress_streak} consecutive no-audio iterations" >&2
+      echo "capture_until_audio_hours: captured_seconds=$captured_seconds/$TARGET_SECONDS (incomplete)" >&2
+      echo "capture_until_audio_hours: check the RTL dongle (rtl_test -t) and re-run to resume" >&2
+      exit 1
+    fi
+    echo "capture_until_audio_hours: sleeping ${RESTART_BACKOFF_SECONDS}s before retry" >&2
     sleep "$RESTART_BACKOFF_SECONDS"
+  else
+    zero_progress_streak=0
   fi
 done
 
