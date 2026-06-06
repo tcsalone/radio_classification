@@ -27,6 +27,7 @@ from radio_classifier.persistence.broadcast_store import (
     BroadcastStore,
     _display_key,
     _prefer_display_value,
+    _song_title_key,
 )
 from radio_classifier.segments.normalize import normalize_token
 
@@ -386,8 +387,12 @@ def _normalize_dedupe_key(artist: str | None, title: str | None) -> tuple[str, s
     Returning a 2-tuple of strings (not Optional) lets the caller use the
     value directly as a dict key without worrying about Nones — empty
     strings are still distinguishable from real content.
+
+    The title uses :func:`_song_title_key` so the punctuation/format drift the
+    upsert path now folds (``(feat. X)`` vs ``_feat. X``) also folds here when
+    cleaning up a pre-existing database.
     """
-    return (_display_key(artist), _display_key(title))
+    return (_display_key(artist), _song_title_key(title))
 
 
 def _iter_dedupe_groups(store: BroadcastStore) -> Iterator[DedupeGroup]:
@@ -481,7 +486,9 @@ def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeRepor
                 best_title = survivor.title
                 for loser in group.losers:
                     best_artist = _prefer_display_value(best_artist, loser.artist)
-                    best_title = _prefer_display_value(best_title, loser.title)
+                    best_title = _prefer_display_value(
+                        best_title, loser.title, key_func=_song_title_key
+                    )
                 cur = conn.execute(
                     f"UPDATE broadcast_events SET song_id = ?, artist = COALESCE(artist, ?), "
                     f"track_title = COALESCE(track_title, ?) "

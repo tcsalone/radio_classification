@@ -59,6 +59,55 @@ def test_key_change_emits_closed_segment() -> None:
     assert fin[0].commercial_id == 7
 
 
+def test_same_song_id_merges_despite_title_string_drift() -> None:
+    """Audfprint (underscore) and Shazam (apostrophe) report the same song_id
+    with different display titles. They must collapse to ONE segment, not the
+    10-event fragmentation observed in the live DB."""
+    r = SegmentReducer()
+    out: list = []
+    # audfprint window: filename-derived underscore title
+    out.extend(
+        r.feed(
+            segment_input_for_song(
+                window_start_utc=_ts(0),
+                artist="Modest Mouse",
+                title="Picking Dragons_ Pockets",
+                song_id=57,
+                confidence=159.0,
+            )
+        )
+    )
+    # shazam window: apostrophe title, no confidence — same canonical song_id
+    out.extend(
+        r.feed(
+            segment_input_for_song(
+                window_start_utc=_ts(10),
+                artist="Modest Mouse",
+                title="Picking Dragons' Pockets",
+                song_id=57,
+                confidence=None,
+            )
+        )
+    )
+    out.extend(
+        r.feed(
+            segment_input_for_song(
+                window_start_utc=_ts(20),
+                artist="Modest Mouse",
+                title="Picking Dragons_ Pockets",
+                song_id=57,
+                confidence=131.0,
+            )
+        )
+    )
+    out.extend(r.finalize(_ts(20), 10.0))
+
+    assert len(out) == 1, "same song_id windows must form a single segment"
+    assert out[0].song_id == 57
+    assert out[0].timestamp_start == _ts(0)
+    assert out[0].timestamp_end == _ts(30)
+
+
 def test_different_song_ids_dont_merge() -> None:
     r = SegmentReducer()
     k_song_a = SegmentKey(BroadcastCategory.SONG, "artist", "title", None, song_id=1)
@@ -379,7 +428,13 @@ def test_finalize_empty_when_never_fed() -> None:
     assert r.finalize("2020-01-01T00:00:00.000Z", 10.0) == []
 
 
-def test_segment_input_for_song_normalizes_keys() -> None:
+def test_segment_input_for_song_with_song_id_keys_on_id_only() -> None:
+    """A canonical song_id is the sole identity; artist/title keys are dropped.
+
+    upsert_song already folds apostrophe/underscore/feature drift into one id,
+    so keying the reducer on the raw title would fragment a single play when
+    audfprint (underscore) and Shazam (apostrophe) alternate window-to-window.
+    """
     si = segment_input_for_song(
         window_start_utc="2020-01-01T00:00:00.000Z",
         artist=" Taylor Swift ",
@@ -387,10 +442,25 @@ def test_segment_input_for_song_normalizes_keys() -> None:
         song_id=11,
     )
     assert si.key.category is BroadcastCategory.SONG
-    assert si.key.artist_key == "taylor swift"
-    assert si.key.title_key == "anti-hero"
+    assert si.key.artist_key is None
+    assert si.key.title_key is None
     assert si.key.song_id == 11
     assert si.artist == " Taylor Swift "  # display field preserves original
+    assert si.track_title == "ANTI-HERO"
+
+
+def test_segment_input_for_song_without_song_id_keeps_normalized_keys() -> None:
+    """When there is no song_id (e.g. dry-run with no store), the normalized
+    artist/title keys still drive identity so adjacent same-track windows merge."""
+    si = segment_input_for_song(
+        window_start_utc="2020-01-01T00:00:00.000Z",
+        artist=" Taylor Swift ",
+        title="ANTI-HERO",
+        song_id=None,
+    )
+    assert si.key.artist_key == "taylor swift"
+    assert si.key.title_key == "anti-hero"
+    assert si.key.song_id is None
 
 
 def test_segment_input_for_unknown_song_has_null_keys() -> None:

@@ -275,6 +275,47 @@ def test_upsert_song_collapses_shazam_then_audfprint_into_one_row(tmp_path: Path
         assert n == 1
 
 
+def test_upsert_song_folds_feature_suffix_punctuation_drift(tmp_path: Path) -> None:
+    """Shazam's '(feat. X)' parens and the audfprint filename's '_feat. X'
+    underscore are the SAME recording and must resolve to one row, while a
+    plain title with no feature credit stays distinct.
+
+    Mirrors the Yellowcard 'Bedroom Posters' rows observed in the live DB:
+    id 82 (shazam, parens) and id 224 (audfprint, underscore) were two rows for
+    one recording, fragmenting the play log.
+    """
+    db = tmp_path / "rc.db"
+    with BroadcastStore(db) as store:
+        shazam_feat = store.upsert_song(
+            artist="Yellowcard",
+            title="Bedroom Posters (feat. Good Charlotte)",
+            source="shazam",
+        )
+        audfprint_feat = store.upsert_song(
+            artist="Yellowcard",
+            title="Bedroom Posters _feat. Good Charlotte",
+            audfprint_track_id="data/reference/songs/Yellowcard - Bedroom Posters _feat. Good Charlotte.mp3",
+            source="audfprint",
+        )
+        assert shazam_feat == audfprint_feat, (
+            "parens vs underscore feature credit must be one song"
+        )
+
+        # The non-feature base recording must remain a separate row.
+        base = store.upsert_song(
+            artist="Yellowcard",
+            title="Bedroom Posters",
+            audfprint_track_id="data/reference/songs/Yellowcard - Bedroom Posters.mp3",
+            source="audfprint",
+        )
+        assert base != shazam_feat, "feat version and base version stay distinct"
+
+        n = store.connection.execute(
+            "SELECT COUNT(*) FROM songs WHERE artist = 'Yellowcard'"
+        ).fetchone()[0]
+        assert n == 2
+
+
 def test_upsert_song_is_case_insensitive(tmp_path: Path) -> None:
     """Trivial casing/whitespace differences between Shazam and audfprint
     titles must not produce two rows."""

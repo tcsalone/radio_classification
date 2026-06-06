@@ -43,16 +43,27 @@ def segment_input_for_song(
 ) -> SegmentInput:
     """Build a ``SONG`` :class:`SegmentInput` from a Tier-1 / Shazam match.
 
-    ``song_id=None`` is permitted (unknown-song segment from Tier 2). The
-    segment key still normalizes by ``(artist_key, title_key)`` so unknown
-    songs back-to-back merge into one segment (we can't distinguish them).
+    When ``song_id`` is set it is the **sole** identity for segment equality:
+    ``artist_key``/``title_key`` are left ``None``. ``song_id`` is the canonical
+    id returned by :meth:`BroadcastStore.upsert_song`, which already folds the
+    apostrophe/underscore/feature-suffix drift between Shazam (``Picking
+    Dragons' Pockets``) and the audfprint reference filename (``Picking
+    Dragons_ Pockets``). Keying the reducer on the raw normalized title instead
+    fragmented one continuous play into many tiny events whenever consecutive
+    windows alternated between the two detectors. Riding on ``song_id`` keeps a
+    single play contiguous regardless of which tier identified each window.
+
+    ``song_id=None`` is permitted (unknown-song segment from Tier 2). In that
+    case the key still normalizes by ``(artist_key, title_key)`` so back-to-back
+    unknown songs merge into one segment (we can't distinguish them).
     """
+    has_song_id = song_id is not None
     return SegmentInput(
         window_start_utc=window_start_utc,
         key=SegmentKey(
             category=BroadcastCategory.SONG,
-            artist_key=normalize_token(artist),
-            title_key=normalize_token(title),
+            artist_key=None if has_song_id else normalize_token(artist),
+            title_key=None if has_song_id else normalize_token(title),
             brand_key=None,
             song_id=song_id,
             commercial_id=None,

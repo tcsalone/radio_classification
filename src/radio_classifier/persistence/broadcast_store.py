@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 from radio_classifier.segments.reducer import duration_seconds
@@ -22,6 +23,14 @@ _ARTIST_DISPLAY_ALIASES = {
 # ("Picking Dragons' Pockets"). U+02BC (modifier letter apostrophe) shows
 # up in some international band names, and U+2018 / U+201B for completeness.
 _TYPOGRAPHIC_APOSTROPHES = "\u2018\u2019\u02BC\u201B"
+
+# Wrapping/sentence punctuation that the two detectors disagree on for the same
+# recording. Shazam returns "Bedroom Posters (feat. Good Charlotte)" while the
+# audfprint reference filename surfaces "Bedroom Posters _feat. Good Charlotte".
+# After dropping apostrophes/underscores the remaining difference is the parens
+# and the period, so neutralize those too — without removing the feature words,
+# which keeps a genuine "Song" distinct from "Song (feat. X)".
+_SONG_TITLE_PUNCT_RE = re.compile(r"[()\[\]{}.,]+")
 
 
 def _display_key(value: str | None) -> str:
@@ -47,6 +56,24 @@ def _display_key(value: str | None) -> str:
     for ch in _TYPOGRAPHIC_APOSTROPHES:
         raw = raw.replace(ch, "'")
     raw = raw.replace("'", "").replace("_", "")
+    return " ".join(raw.strip().split()).casefold()
+
+
+def _song_title_key(value: str | None) -> str:
+    """Identity key for song titles: ``_display_key`` plus punctuation folding.
+
+    Extends :func:`_display_key` by neutralizing wrapping/sentence punctuation
+    (parentheses, brackets, braces, periods, commas) so format drift on the
+    *same* recording collapses — e.g. Shazam's ``Bedroom Posters (feat. Good
+    Charlotte)`` and the audfprint filename's ``Bedroom Posters _feat. Good
+    Charlotte`` resolve to one ``songs`` row, while a plain ``Bedroom Posters``
+    (no feature credit) stays distinct.
+    """
+    raw = value or ""
+    for ch in _TYPOGRAPHIC_APOSTROPHES:
+        raw = raw.replace(ch, "'")
+    raw = raw.replace("'", "").replace("_", "")
+    raw = _SONG_TITLE_PUNCT_RE.sub(" ", raw)
     return " ".join(raw.strip().split()).casefold()
 
 
@@ -111,6 +138,7 @@ def _prefer_display_value(
     incoming: str | None,
     *,
     aliases: dict[str, str] | None = None,
+    key_func: Callable[[str | None], str] = _display_key,
 ) -> str | None:
     """Pick the least-noisy display value without changing song identity.
 
@@ -130,7 +158,7 @@ def _prefer_display_value(
         return existing_clean
     if existing_clean == incoming_clean:
         return existing_clean
-    if _display_key(existing_clean) != _display_key(incoming_clean):
+    if key_func(existing_clean) != key_func(incoming_clean):
         return existing_clean
     if aliases and _display_key(existing_clean) in aliases:
         return incoming_clean
@@ -193,6 +221,7 @@ class BroadcastStore:
         _ensure_database(self._db_path, self._schema_path)
         self._conn = sqlite3.connect(self._db_path)
         self._conn.create_function("display_key", 1, _display_key, deterministic=True)
+        self._conn.create_function("song_title_key", 1, _song_title_key, deterministic=True)
         self._conn.execute("PRAGMA foreign_keys = ON")
         if use_wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -351,13 +380,13 @@ class BroadcastStore:
         display_artist = _display_value(artist, aliases=_ARTIST_DISPLAY_ALIASES)
         display_title = _display_value(title)
         norm_artist = _display_key(display_artist)
-        norm_title = _display_key(display_title)
+        norm_title = _song_title_key(display_title)
         existing = self._conn.execute(
             """
             SELECT id, audfprint_track_id, source, artist, title
             FROM songs
             WHERE display_key(artist) = ?
-              AND display_key(title) = ?
+              AND song_title_key(title) = ?
             ORDER BY id ASC
             LIMIT 1
             """,
@@ -386,7 +415,9 @@ class BroadcastStore:
                 display_artist,
                 aliases=_ARTIST_DISPLAY_ALIASES,
             )
-            next_title = _prefer_display_value(existing_title, display_title)
+            next_title = _prefer_display_value(
+                existing_title, display_title, key_func=_song_title_key
+            )
 
             if (
                 next_track_id != existing_track_id
