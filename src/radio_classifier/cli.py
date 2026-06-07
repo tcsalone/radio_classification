@@ -712,6 +712,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the dedupe plan without modifying the DB.",
     )
 
+    songs_stitch = songs_sub.add_parser(
+        "stitch",
+        help=(
+            "Fold contiguous same-song SONG events split across capture-block "
+            "boundaries into a single play (post-classification cleanup)."
+        ),
+    )
+    songs_stitch.add_argument("--db-path", type=Path, default=None)
+    songs_stitch.add_argument(
+        "--since", type=str, default=None, help="Window start as duration/ISO (default: all)"
+    )
+    songs_stitch.add_argument(
+        "--from", dest="from_utc", type=str, default=None, help="Explicit inclusive UTC window start"
+    )
+    songs_stitch.add_argument(
+        "--to", dest="until_utc", type=str, default=None, help="Explicit exclusive UTC window end"
+    )
+    songs_stitch.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=2.0,
+        help="Max gap between fragments to treat as contiguous (default: 2.0).",
+    )
+    songs_stitch.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the stitch plan without modifying the DB (default).",
+    )
+    songs_stitch.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the stitch plan. Without this flag the command is read-only.",
+    )
+
     # ---- commercials cleanup workflow
     commercials = sub.add_parser(
         "commercials",
@@ -2173,6 +2207,54 @@ def cmd_songs_dedupe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_songs_stitch(args: argparse.Namespace) -> int:
+    from radio_classifier.discovery import stitch_song_plays
+    from radio_classifier.reports import parse_since
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(f"radio-classifier songs stitch: db not found: {db_path}", file=sys.stderr)
+        return 1
+
+    if (args.from_utc or args.until_utc) and args.since:
+        raise _CliConfigError("stitch window accepts either --since or --from/--to, not both")
+    if args.from_utc:
+        since_utc: str | None = _normalize_utc_text(args.from_utc)
+    elif args.since:
+        since_utc = parse_since(args.since)
+    else:
+        since_utc = None
+    until_utc = _normalize_utc_text(args.until_utc) if args.until_utc else None
+
+    dry_run = True if args.dry_run else not args.apply
+    with BroadcastStore(db_path) as store:
+        report = stitch_song_plays(
+            store,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            max_gap_seconds=args.max_gap_seconds,
+            dry_run=dry_run,
+        )
+
+    verb = "would stitch" if report.dry_run else "stitched"
+    print(
+        f"radio-classifier: {verb} {report.events_absorbed} fragment(s) into "
+        f"{len(report.groups)} song play(s) (scanned {report.events_scanned} SONG event(s))",
+        file=sys.stderr,
+    )
+    for g in report.groups[:25]:
+        cross = " [cross-run]" if g.spanned_capture_runs else ""
+        print(
+            f"  song_id={g.song_id} {g.artist} - {g.title}: "
+            f"keep event {g.survivor_event_id}, absorb {len(g.absorbed_event_ids)} "
+            f"[{g.start_utc} -> {g.end_utc}]{cross}",
+            file=sys.stderr,
+        )
+    if len(report.groups) > 25:
+        print(f"  ... and {len(report.groups) - 25} more", file=sys.stderr)
+    return 0
+
+
 def cmd_commercials_dedupe(args: argparse.Namespace) -> int:
     from radio_classifier.commercials import dedupe_commercials
 
@@ -2387,6 +2469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_songs_promote(args)
             if args.songs_command == "dedupe":
                 return cmd_songs_dedupe(args)
+            if args.songs_command == "stitch":
+                return cmd_songs_stitch(args)
             if args.songs_command == "enrich-releases":
                 return cmd_songs_enrich_releases(args)
             return 2

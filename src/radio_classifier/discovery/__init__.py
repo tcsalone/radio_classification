@@ -14,6 +14,11 @@ from radio_classifier.discovery.songs import (
     list_shazam_discoveries,
     promote_to_tracklist,
 )
+from radio_classifier.discovery.stitch import (
+    StitchGroup,
+    StitchReport,
+    stitch_song_plays,
+)
 
 __all__ = [
     "DedupeGroup",
@@ -21,7 +26,10 @@ __all__ = [
     "DiscoveryRow",
     "PromoteResult",
     "PromotedTrack",
+    "StitchGroup",
+    "StitchReport",
     "dedupe_songs",
     "list_shazam_discoveries",
     "promote_to_tracklist",
+    "stitch_song_plays",
 ]

@@ -57,28 +57,34 @@ echo "--- 4. Deduplicating Commercials ---"
 echo "--- 5. Deduplicating Songs ---"
 .venv/bin/python -m radio_classifier songs dedupe --db-path "${DB_PATH}"
 
-# 6. Enrich song release dates from MusicBrainz
-echo "--- 6. Enriching Song Release Dates ---"
+# 6. Stitch songs split across capture-block boundaries
+# Runs after dedupe so fragments are on canonical song_ids before merging the
+# block-tail/head pairs that each block's independent reducer could not see.
+echo "--- 6. Stitching Block-Boundary Song Fragments ---"
+.venv/bin/python -m radio_classifier songs stitch --db-path "${DB_PATH}" --apply
+
+# 7. Enrich song release dates from MusicBrainz
+echo "--- 7. Enriching Song Release Dates ---"
 set +e
 .venv/bin/python -m radio_classifier songs enrich-releases --db-path "${DB_PATH}"
 set -e
 
-# 7. Prune old WAVs (retains sidecars)
-echo "--- 7. Pruning WAVs Older than 7 Days ---"
+# 8. Prune old WAVs (retains sidecars)
+echo "--- 8. Pruning WAVs Older than 7 Days ---"
 if [ -f "./scripts/prune_old_wavs.sh" ]; then
     ./scripts/prune_old_wavs.sh data/captures
 else
     echo "Warning: ./scripts/prune_old_wavs.sh not found, skipping."
 fi
 
-# 8. Generate Reports
-echo "--- 8. Generating Reports ---"
+# 9. Generate Reports
+echo "--- 9. Generating Reports ---"
 mkdir -p data/reports
 .venv/bin/python -m radio_classifier report dashboard --db-path "${DB_PATH}" --since 24h --out data/reports/dashboard.html
 .venv/bin/python -m radio_classifier report artist-plays --db-path "${DB_PATH}" --since 24h --top 3 --out data/reports/artist-plays.html
 
-# 9. Print Discoveries list so the operator can see what was found
-echo "--- 9. Active Shazam Discoveries Outstanding ---"
+# 10. Print Discoveries list so the operator can see what was found
+echo "--- 10. Active Shazam Discoveries Outstanding ---"
 .venv/bin/python -m radio_classifier songs discovered --db-path "${DB_PATH}" --since 24h --top 20 --min-plays 1 | tee "data/reports/discovered-summary-${TS}.txt"
 
 echo "=== Post-Run Cleanup Completed Successfully: $(date -u +'%Y-%m-%d %H:%M:%S UTC') ==="
