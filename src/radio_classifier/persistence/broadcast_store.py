@@ -31,6 +31,16 @@ _TYPOGRAPHIC_APOSTROPHES = "\u2018\u2019\u02BC\u201B"
 # and the period, so neutralize those too — without removing the feature words,
 # which keeps a genuine "Song" distinct from "Song (feat. X)".
 _SONG_TITLE_PUNCT_RE = re.compile(r"[()\[\]{}.,]+")
+_FEATURE_SUFFIX_RE = re.compile(
+    r"\s+(?:feat|ft|featuring)\.?\s+.+$",
+    re.IGNORECASE,
+)
+_REMIX_SUFFIX_RE = re.compile(
+    r"\s+[A-Za-z0-9&.' -]*\bremix\b\s*$",
+    re.IGNORECASE,
+)
+_UNDERSCORE_ARTIST_COLLAB_RE = re.compile(r"\s+_\s+.+$", re.IGNORECASE)
+_REMIX_ARTIST_COLLAB_RE = re.compile(r"\s+(?:[&_+]|\band\b)\s+.+$", re.IGNORECASE)
 
 
 def _display_key(value: str | None) -> str:
@@ -63,18 +73,46 @@ def _song_title_key(value: str | None) -> str:
     """Identity key for song titles: ``_display_key`` plus punctuation folding.
 
     Extends :func:`_display_key` by neutralizing wrapping/sentence punctuation
-    (parentheses, brackets, braces, periods, commas) so format drift on the
-    *same* recording collapses — e.g. Shazam's ``Bedroom Posters (feat. Good
-    Charlotte)`` and the audfprint filename's ``Bedroom Posters _feat. Good
-    Charlotte`` resolve to one ``songs`` row, while a plain ``Bedroom Posters``
-    (no feature credit) stays distinct.
+    (parentheses, brackets, braces, periods, commas) and drops trailing feature
+    / remix qualifiers so format drift on the *same* recording collapses —
+    e.g. Shazam's ``Bedroom Posters (feat. Good Charlotte)`` and the
+    audfprint filename's ``Bedroom Posters _feat. Good Charlotte`` resolve to
+    the same identity as the station's plain ``Bedroom Posters`` display.
     """
     raw = value or ""
     for ch in _TYPOGRAPHIC_APOSTROPHES:
         raw = raw.replace(ch, "'")
-    raw = raw.replace("'", "").replace("_", "")
+    raw = re.sub(r"\s+_", " ", raw)
+    raw = raw.replace("_", "")
     raw = _SONG_TITLE_PUNCT_RE.sub(" ", raw)
+    raw = _FEATURE_SUFFIX_RE.sub("", raw)
+    raw = _REMIX_SUFFIX_RE.sub("", raw)
+    raw = raw.replace("'", "")
     return " ".join(raw.strip().split()).casefold()
+
+
+def _title_has_remix_suffix(value: str | None) -> bool:
+    raw = value or ""
+    raw = re.sub(r"\s+_", " ", raw)
+    raw = raw.replace("_", "")
+    raw = _SONG_TITLE_PUNCT_RE.sub(" ", raw)
+    return _REMIX_SUFFIX_RE.search(raw) is not None
+
+
+def _song_artist_key(artist: str | None, title: str | None) -> str:
+    """Artist identity for songs, with narrow remix-collab folding.
+
+    Shazam may report a remixer/collaborator in the artist field for a remix
+    while audfprint's curated reference keeps the base artist. Only strip that
+    collaborator tail when the title also carries a remix suffix; otherwise
+    ``Artist & Artist`` remains distinct.
+    """
+
+    raw = artist or ""
+    raw = _UNDERSCORE_ARTIST_COLLAB_RE.sub("", raw)
+    if _title_has_remix_suffix(title):
+        raw = _REMIX_ARTIST_COLLAB_RE.sub("", raw)
+    return _display_key(raw)
 
 
 def _display_value(value: str | None, *, aliases: dict[str, str] | None = None) -> str | None:
@@ -222,6 +260,7 @@ class BroadcastStore:
         self._conn = sqlite3.connect(self._db_path)
         self._conn.create_function("display_key", 1, _display_key, deterministic=True)
         self._conn.create_function("song_title_key", 1, _song_title_key, deterministic=True)
+        self._conn.create_function("song_artist_key", 2, _song_artist_key, deterministic=True)
         self._conn.execute("PRAGMA foreign_keys = ON")
         if use_wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
@@ -379,13 +418,13 @@ class BroadcastStore:
 
         display_artist = _display_value(artist, aliases=_ARTIST_DISPLAY_ALIASES)
         display_title = _display_value(title)
-        norm_artist = _display_key(display_artist)
+        norm_artist = _song_artist_key(display_artist, display_title)
         norm_title = _song_title_key(display_title)
         existing = self._conn.execute(
             """
             SELECT id, audfprint_track_id, source, artist, title
             FROM songs
-            WHERE display_key(artist) = ?
+            WHERE song_artist_key(artist, title) = ?
               AND song_title_key(title) = ?
             ORDER BY id ASC
             LIMIT 1

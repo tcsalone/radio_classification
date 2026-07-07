@@ -8,6 +8,16 @@ possible), and SQLite stores timestamps + duration for offline analysis.
 Forked from [`live105sux`](../live105sux/). Authoritative design
 document: **[`SPEC.md`](SPEC.md)**.
 
+## Platforms
+
+| Stack | When to use | Entry point |
+| --- | --- | --- |
+| **WSL2 + NVIDIA (legacy)** | Existing Windows/WSL host with RTX GPU, `usbipd`, Ollama on **:11435** | [`AGENT_RUNBOOK.md`](AGENT_RUNBOOK.md), [`scripts/`](scripts/) |
+| **macOS standalone (M4)** | Native Apple Silicon capture + classify; dongle plugs in directly; Ollama on **:11434** | [`macos/README.md`](macos/README.md), [`AGENT_RUNBOOK_MACOS.md`](AGENT_RUNBOOK_MACOS.md) |
+
+Both stacks share the same Python core (`src/radio_classifier/`) and SQLite
+database. Copy `data/store/broadcast.db` between machines as needed.
+
 ## The funnel
 
 | Tier | Purpose | Cost | Backend |

@@ -27,6 +27,7 @@ from radio_classifier.persistence.broadcast_store import (
     BroadcastStore,
     _display_key,
     _prefer_display_value,
+    _song_artist_key,
     _song_title_key,
 )
 from radio_classifier.segments.normalize import normalize_token
@@ -392,7 +393,7 @@ def _normalize_dedupe_key(artist: str | None, title: str | None) -> tuple[str, s
     upsert path now folds (``(feat. X)`` vs ``_feat. X``) also folds here when
     cleaning up a pre-existing database.
     """
-    return (_display_key(artist), _song_title_key(title))
+    return (_song_artist_key(artist, title), _song_title_key(title))
 
 
 def _iter_dedupe_groups(store: BroadcastStore) -> Iterator[DedupeGroup]:
@@ -506,16 +507,16 @@ def dedupe_songs(store: BroadcastStore, *, dry_run: bool = False) -> DedupeRepor
                             "UPDATE songs SET audfprint_track_id = ?, source = ? WHERE id = ?",
                             (rescue.audfprint_track_id, "audfprint", survivor.song_id),
                         )
-                if best_artist != survivor.artist or best_title != survivor.title:
-                    conn.execute(
-                        "UPDATE songs SET artist = ?, title = ? WHERE id = ?",
-                        (best_artist, best_title, survivor.song_id),
-                    )
                 cur = conn.execute(
                     f"DELETE FROM songs WHERE id IN ({placeholders})",
                     loser_ids,
                 )
                 deleted += cur.rowcount or 0
+                if best_artist != survivor.artist or best_title != survivor.title:
+                    conn.execute(
+                        "UPDATE songs SET artist = ?, title = ? WHERE id = ?",
+                        (best_artist, best_title, survivor.song_id),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()

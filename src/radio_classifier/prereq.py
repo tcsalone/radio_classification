@@ -23,6 +23,8 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
+from radio_classifier.platform import is_macos
+
 
 @dataclass
 class CheckResult:
@@ -34,6 +36,12 @@ class CheckResult:
 def check_rtl_fm_present() -> CheckResult:
     if shutil.which("rtl_fm"):
         return CheckResult("rtl_fm on PATH", True, "")
+    if is_macos():
+        return CheckResult(
+            "rtl_fm on PATH",
+            False,
+            "rtl_fm not found; brew install librtlsdr",
+        )
     return CheckResult("rtl_fm on PATH", False, "rtl_fm not found; apt install rtl-sdr")
 
 
@@ -179,12 +187,33 @@ def check_ollama_tags(base_url: str | None = None) -> CheckResult:
     return CheckResult("ollama /api/tags", True, f"models={len(models)}")
 
 
+def check_macos_stack() -> CheckResult:
+    """Report macOS standalone expectations (Metal Ollama, no NVIDIA CUDA wheels)."""
+    if not is_macos():
+        return CheckResult("macOS standalone stack", True, "not applicable on this OS")
+    detail = (
+        "Apple Silicon: Ollama.app on :11434, pip install without [gpu], "
+        "source macos/env.defaults before capture"
+    )
+    return CheckResult("macOS standalone stack", True, detail)
+
+
 def run_checks(*, with_gpu: bool, with_ollama: bool) -> list[CheckResult]:
     checks: list[CheckResult] = [
         check_rtl_fm_present(),
         check_audfprint_present(),
     ]
-    if with_gpu:
+    if is_macos():
+        checks.append(check_macos_stack())
+        if with_gpu:
+            checks.append(
+                CheckResult(
+                    "NVIDIA GPU checks",
+                    True,
+                    "skipped on macOS (use Ollama Metal; Whisper/YAMNet on CPU)",
+                )
+            )
+    elif with_gpu:
         checks.append(check_nvidia_smi())
         checks.append(check_ctranslate2_cuda())
         checks.append(check_whisper_tiny_cuda_smoke())

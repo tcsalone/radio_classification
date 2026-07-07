@@ -1,63 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resilient bounded capture supervisor.
+# macOS fork of scripts/capture_until_audio_hours.sh
 #
-# Goal: collect N hours of actual audio, not merely run for N wall-clock hours.
-# If rtl_fm / USB/IP drops mid-run, the completed and partial chunks are kept,
-# classified, appended to the persistent DB, and the next iteration resumes
-# until the accumulated sidecar durations reach the requested target.
+# Resilient bounded capture supervisor. Collects N hours of actual audio,
+# restarting on USB glitches until the target is reached.
 #
 # Usage:
-#   ./scripts/capture_until_audio_hours.sh 20
-#
-# Environment:
-#   DB_PATH=data/store/broadcast.db
-#   BLOCK_SECONDS=1800
-#   RESTART_BACKOFF_SECONDS=30
-#   RETENTION_DAYS=7
-#   MIN_TOPUP_SECONDS=120        # treat target as reached when the remaining
-#                                # sliver is this small (avoids 1s top-up blocks
-#                                # that cannot produce classifier windows)
-#   MAX_ZERO_PROGRESS_ITERS=3    # bail after this many consecutive iterations
-#                                # that capture no audio (e.g. dongle gone)
-#   FREQUENCY=105300000
-#   DEVICE_INDEX=0
-#   SAMPLE_RATE=48000
+#   bash macos/scripts/capture_until_audio_hours.sh 20
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=/dev/null
+source "$ROOT_DIR/macos/env.defaults"
 
 TARGET_HOURS="${1:-${TARGET_HOURS:-20}}"
 DB_PATH="${DB_PATH:-data/store/broadcast.db}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-1800}"
 RESTART_BACKOFF_SECONDS="${RESTART_BACKOFF_SECONDS:-30}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
-# Completion tolerance: once we are within this many seconds of the target we
-# stop, rather than spawning a tiny final block. A 1s top-up cannot yield a
-# classifier window, so the old behaviour was an infinite "no audio captured"
-# loop that also minted hundreds of empty capture_runs rows.
 MIN_TOPUP_SECONDS="${MIN_TOPUP_SECONDS:-120}"
-# Safety net: if the dongle dies near the end, consecutive iterations capture
-# nothing. Give up after this many in a row instead of looping forever.
 MAX_ZERO_PROGRESS_ITERS="${MAX_ZERO_PROGRESS_ITERS:-3}"
-
-# Tier-3 (Whisper -> LLM) speech classification talks to the native GPU Ollama
-# server. The classifier's built-in default is :11434 (the old snap build), but
-# our GPU build listens on :11435 and the snap build is disabled. Export the
-# host here so every per-block `classify` inherits it. A missing/wrong host
-# silently degrades ALL COMMERCIAL/DJ/STATION/PSA speech to "unknown" — exactly
-# the failure that wasted the first 2026-06-07 48h run.
-export RADIO_CLASSIFIER_OLLAMA_HOST="${RADIO_CLASSIFIER_OLLAMA_HOST:-http://127.0.0.1:11435}"
 
 mkdir -p data/logs
 
-# Preflight: fail loudly if Tier-3 is unreachable rather than discovering 48h
-# later that every non-song segment was dropped.
 if ! curl -sf --max-time 5 "${RADIO_CLASSIFIER_OLLAMA_HOST%/}/api/tags" >/dev/null 2>&1; then
   echo "capture_until_audio_hours: ERROR Tier-3 LLM unreachable at $RADIO_CLASSIFIER_OLLAMA_HOST" >&2
-  echo "capture_until_audio_hours: start it first, e.g.:" >&2
-  echo "  OLLAMA_HOST=127.0.0.1:11435 OLLAMA_KEEP_ALIVE=-1 ~/.local/ollama/bin/ollama serve >data/logs/ollama-serve.log 2>&1 &" >&2
+  echo "capture_until_audio_hours: start Ollama.app or: ollama serve" >&2
   exit 3
 fi
 echo "capture_until_audio_hours: tier3_llm=$RADIO_CLASSIFIER_OLLAMA_HOST (reachable)"
@@ -120,8 +90,6 @@ PY
 while [[ "$captured_seconds" -lt "$TARGET_SECONDS" ]]; do
   remaining=$((TARGET_SECONDS - captured_seconds))
 
-  # Stop chasing a sub-block sliver. Only applies once we have made real
-  # progress, so a small test target (e.g. TARGET < MIN_TOPUP) still runs once.
   if [[ "$captured_seconds" -gt 0 && "$remaining" -le "$MIN_TOPUP_SECONDS" ]]; then
     echo "capture_until_audio_hours: within tolerance (remaining=${remaining}s <= ${MIN_TOPUP_SECONDS}s); treating target as reached"
     break
@@ -143,7 +111,7 @@ while [[ "$captured_seconds" -lt "$TARGET_SECONDS" ]]; do
   set +e
   RETENTION_DAYS="$RETENTION_DAYS" \
     BLOCK_SECONDS="$iter_block_seconds" \
-    bash scripts/continuous_capture_blocks.sh "$blocks" --append-db "$DB_PATH" \
+    bash macos/scripts/continuous_capture_blocks.sh "$blocks" --append-db "$DB_PATH" \
     2>&1 | tee "$iter_log"
   rc="${PIPESTATUS[0]}"
   set -e

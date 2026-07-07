@@ -1,45 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Continuously capture one RTL-SDR stream into fixed WAV chunks while one
-# classifier worker processes completed chunks into a single SQLite DB.
+# macOS fork of scripts/continuous_capture_blocks.sh
 #
-# Unlike morning_run_blocks.sh, this does not restart rtl_fm for each block.
-# Capture is uninterrupted; classification can lag behind without losing audio.
+# Differences from the WSL script:
+#   - Sources macos/env.defaults (Ollama :11434, CPU Whisper)
+#   - Stall watchdog uses macos/lib/file_size.sh (BSD stat)
+#   - No WSL/usbipd assumptions
 #
 # Usage:
-#   ./scripts/continuous_capture_blocks.sh              # 4x 30-minute chunks
-#   ./scripts/continuous_capture_blocks.sh 24           # 12 hours
-#   ./scripts/continuous_capture_blocks.sh 24 --append-db data/store/broadcast.db
-#
-# Tunables:
-#   BLOCK_SECONDS=1800
-#   FREQUENCY=105300000
-#   DEVICE_INDEX=0
-#   SAMPLE_RATE=48000
-#   RUN_ID=continuous_my_test   # override the auto-generated run id
-#   APPEND_DB=data/store/broadcast.db  # reuse an existing long-term DB
-#
-# Run identity:
-#   By default each invocation gets a unique run id that includes the UTC
-#   start *time* (not just date), so two captures the same day will never
-#   collide. The script refuses to start if the resolved run dir already exists.
-#   By default it also refuses to use an existing run-specific DB. Pass
-#   --append-db (or APPEND_DB) when you intentionally want to write a fresh run's
-#   events into a long-term persistent SQLite store.
+#   bash macos/scripts/continuous_capture_blocks.sh
+#   bash macos/scripts/continuous_capture_blocks.sh 24 --append-db data/store/broadcast.db
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
+
+# shellcheck source=/dev/null
+source "$ROOT_DIR/macos/env.defaults"
+# shellcheck source=/dev/null
+source "$ROOT_DIR/macos/lib/file_size.sh"
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/continuous_capture_blocks.sh [BLOCK_COUNT] [--append-db PATH]
-
-Examples:
-  ./scripts/continuous_capture_blocks.sh
-  ./scripts/continuous_capture_blocks.sh 24
-  ./scripts/continuous_capture_blocks.sh 24 --append-db data/store/broadcast.db
+  bash macos/scripts/continuous_capture_blocks.sh [BLOCK_COUNT] [--append-db PATH]
 
 Environment:
   BLOCK_SECONDS=1800
@@ -48,6 +32,9 @@ Environment:
   SAMPLE_RATE=48000
   RUN_ID=continuous_my_test
   APPEND_DB=data/store/broadcast.db
+  RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11434
+  WHISPER_DEVICE=cpu
+  WHISPER_COMPUTE_TYPE=int8
 EOF
 }
 
@@ -88,32 +75,10 @@ BLOCK_SECONDS="${BLOCK_SECONDS:-1800}"
 FREQUENCY="${FREQUENCY:-105300000}"
 DEVICE_INDEX="${DEVICE_INDEX:-0}"
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
-TOTAL_SECONDS=$((BLOCK_COUNT * BLOCK_SECONDS))
-
-# Tier-3 LLM host for the per-block `classify` calls below. Defaults to the
-# native GPU Ollama on :11435 (the classifier's own default :11434 is the
-# disabled snap build). Without this, non-song speech silently becomes
-# "unknown". Overridable from the environment.
-export RADIO_CLASSIFIER_OLLAMA_HOST="${RADIO_CLASSIFIER_OLLAMA_HOST:-http://127.0.0.1:11435}"
-
-# Whisper runs on the CPU by default. Running it on CUDA *at the same time* as
-# the GPU Ollama server puts two CUDA contexts on the WSL2 GPU-paravirt layer
-# (dxgkrnl), which repeatedly faulted and crashed the entire VM on 2026-06-07
-# (two crashes in an hour; a dual-context block crashed in ~2 min vs 18 stable
-# blocks single-context). CPU Whisper (int8) keeps the GPU to Ollama alone and
-# ran rock-solid; a 30-min block transcribes in ~10-17 min, and classification
-# is allowed to lag capture. Override WHISPER_DEVICE=cuda only after the host
-# GPU driver/WSL GPU-PV stack is confirmed stable.
 WHISPER_DEVICE="${WHISPER_DEVICE:-cpu}"
 WHISPER_COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE:-int8}"
+TOTAL_SECONDS=$((BLOCK_COUNT * BLOCK_SECONDS))
 
-# Capture stall-watchdog. rtl_fm can silently stop delivering samples (e.g. a
-# USB/IP drop) while staying alive in 'Sl' state; the reader then blocks forever
-# and the per-block wait loop hangs with no error (observed 2026-06-11: ~7.5h
-# lost, only ~2 min of block 2 written). The watchdog watches the in-progress
-# WAV: if it stops growing for STALL_TIMEOUT seconds it kills rtl_fm + the
-# capture process so the resilient supervisor (capture_until_audio_hours.sh)
-# ends this iteration and restarts capture. STALL_TIMEOUT=0 disables it.
 STALL_TIMEOUT="${STALL_TIMEOUT:-180}"
 STALL_POLL="${STALL_POLL:-30}"
 
@@ -131,9 +96,6 @@ fi
 CAPTURE_LOG="data/logs/${RUN_ID}_capture.log"
 SKIPS_LOG="data/logs/${RUN_ID}_skips.log"
 
-# Refuse to start if anything from a prior run with the same id is already on
-# disk. This makes the failure mode loud — operator must pick a fresh RUN_ID
-# or move the old artifacts aside — instead of silently mixing two runs.
 COLLISIONS=()
 if [[ -e "$RUN_DIR" ]]; then COLLISIONS+=("$RUN_DIR"); fi
 if [[ "$APPEND_MODE" -eq 0 && -e "$DB_PATH" ]]; then COLLISIONS+=("$DB_PATH"); fi
@@ -160,6 +122,9 @@ echo "block_seconds=$BLOCK_SECONDS"
 echo "total_seconds=$TOTAL_SECONDS"
 echo "capture_log=$CAPTURE_LOG"
 echo "skips_log=$SKIPS_LOG"
+echo "tier3_llm=$RADIO_CLASSIFIER_OLLAMA_HOST"
+echo "whisper_device=$WHISPER_DEVICE"
+echo "whisper_compute_type=$WHISPER_COMPUTE_TYPE"
 
 .venv/bin/python -m radio_classifier db init --db-path "$DB_PATH" >/dev/null
 CAPTURE_RUN_DB_ID="$(
@@ -219,17 +184,16 @@ wait_for_sidecar() {
   done
 }
 
-# Background watchdog: kill a stalled capture so the supervisor can restart it.
 capture_watchdog() {
-  set +e  # runs in a backgrounded subshell; never let a stray rc abort it
+  set +e
   local cap_pid="$1"
   local last_file="" last_size=-1 stalled_for=0 newest size
   while kill -0 "$cap_pid" 2>/dev/null; do
     sleep "$STALL_POLL"
     newest="$(ls -t "$RUN_DIR"/*.wav 2>/dev/null | head -1 || true)"
-    [[ -z "$newest" ]] && continue            # capture still warming up
-    size="$(stat -c %s "$newest" 2>/dev/null || echo 0)"
-    if [[ "$newest" != "$last_file" ]]; then   # new block -> reset baseline
+    [[ -z "$newest" ]] && continue
+    size="$(file_size_bytes "$newest")"
+    if [[ "$newest" != "$last_file" ]]; then
       last_file="$newest"; last_size="$size"; stalled_for=0; continue
     fi
     if [[ "$size" -gt "$last_size" ]]; then

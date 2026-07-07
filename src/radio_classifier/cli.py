@@ -1062,13 +1062,24 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
         try:
             from radio_classifier.acoustic import YamnetAcousticClassifier
 
-            force_yamnet_cpu = tier3 is not None and args.whisper_device == "cuda"
+            from radio_classifier.platform import is_macos
+
+            force_yamnet_cpu = (tier3 is not None and args.whisper_device == "cuda") or (
+                is_macos() and tier3 is not None
+            )
             if force_yamnet_cpu:
-                print(
-                    "radio-classifier: YAMNet on CPU (Whisper uses CUDA; "
-                    "keeps both tiers within GPU memory on 11 GB cards).",
-                    file=sys.stderr,
-                )
+                if is_macos():
+                    print(
+                        "radio-classifier: YAMNet on CPU (macOS standalone; "
+                        "avoids TensorFlow Metal contention).",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        "radio-classifier: YAMNet on CPU (Whisper uses CUDA; "
+                        "keeps both tiers within GPU memory on 11 GB cards).",
+                        file=sys.stderr,
+                    )
             tier2 = YamnetAcousticClassifier(
                 min_prob=args.tier2_min_prob,
                 speech_bias=not args.no_tier2_speech_bias,

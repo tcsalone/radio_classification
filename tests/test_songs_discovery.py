@@ -354,6 +354,136 @@ def test_dedupe_upgrades_survivor_title_from_filename_underscore_to_apostrophe(
         store.close()
 
 
+def test_upsert_song_collapses_remix_collab_and_feature_suffixes(tmp_path: Path) -> None:
+    """Known production duplicates should resolve to one row before reporting.
+
+    ``Dracula`` arrived as audfprint, Shazam, and re-indexed filename variants
+    with JENNIE sometimes in the artist and sometimes in the remix suffix.
+    ``Bedroom Posters`` arrived as both a plain title and a filename-sanitized
+    feature suffix. Both should be one logical song identity.
+    """
+
+    store = BroadcastStore(tmp_path / "remix-feature-upsert.db")
+    try:
+        dracula_audfprint = store.upsert_song(
+            artist="Tame Impala",
+            title="Dracula _Jennie Remix",
+            audfprint_track_id="data/reference/songs/Tame Impala - Dracula _Jennie Remix.mp3",
+            source="audfprint",
+        )
+        dracula_shazam = store.upsert_song(
+            artist="Tame Impala & JENNIE",
+            title="Dracula (JENNIE Remix)",
+            source="shazam",
+        )
+        dracula_plain = store.upsert_song(
+            artist="Tame Impala",
+            title="Dracula",
+            source="shazam",
+        )
+
+        bedroom_plain = store.upsert_song(
+            artist="Yellowcard",
+            title="Bedroom Posters",
+            audfprint_track_id="data/reference/songs/Yellowcard - Bedroom Posters.mp3",
+            source="audfprint",
+        )
+        bedroom_feature = store.upsert_song(
+            artist="Yellowcard",
+            title="Bedroom Posters _feat. Good Charlotte",
+            audfprint_track_id=(
+                "data/reference/songs/Yellowcard - Bedroom Posters _feat. Good Charlotte.mp3"
+            ),
+            source="audfprint",
+        )
+
+        assert dracula_audfprint == dracula_shazam == dracula_plain
+        assert bedroom_plain == bedroom_feature
+    finally:
+        store.close()
+
+
+def test_dedupe_folds_existing_remix_collab_and_feature_suffix_duplicates(
+    tmp_path: Path,
+) -> None:
+    store = BroadcastStore(tmp_path / "remix-feature-dedupe.db")
+    conn = store.connection
+    rows = [
+        (
+            "Tame Impala",
+            "Dracula _Jennie Remix",
+            "audfprint",
+            "data/reference/songs/Tame Impala - Dracula _Jennie Remix.mp3",
+        ),
+        ("Tame Impala & JENNIE", "Dracula (JENNIE Remix)", "shazam", None),
+        ("Tame Impala", "Dracula", "shazam", None),
+        (
+            "Tame Impala _ JENNIE",
+            "Dracula _JENNIE Remix",
+            "audfprint",
+            "data/reference/songs/Tame Impala _ JENNIE - Dracula _JENNIE Remix.mp3",
+        ),
+        (
+            "Yellowcard",
+            "Bedroom Posters",
+            "audfprint",
+            "data/reference/songs/Yellowcard - Bedroom Posters.mp3",
+        ),
+        (
+            "Yellowcard",
+            "Bedroom Posters _feat. Good Charlotte",
+            "audfprint",
+            "data/reference/songs/Yellowcard - Bedroom Posters _feat. Good Charlotte.mp3",
+        ),
+        (
+            "Fun. _ Janelle Monae",
+            "We Are Young",
+            "audfprint",
+            "data/reference/songs/Fun. _ Janelle Monae - We Are Young.mp3",
+        ),
+        (
+            "Fun.",
+            "We Are Young (feat. Janelle Monáe)",
+            "shazam",
+            None,
+        ),
+    ]
+    for row in rows:
+        conn.execute(
+            "INSERT INTO songs (artist, title, source, audfprint_track_id) VALUES (?, ?, ?, ?)",
+            row,
+        )
+    conn.commit()
+    try:
+        report = dedupe_songs(store, dry_run=False)
+        assert report.collapsed_pairs == 5
+        assert report.rows_deleted == 5
+
+        dracula = conn.execute(
+            "SELECT id, artist, title, source, audfprint_track_id FROM songs "
+            "WHERE song_title_key(title) = 'dracula'"
+        ).fetchall()
+        bedroom = conn.execute(
+            "SELECT id, artist, title, source, audfprint_track_id FROM songs "
+            "WHERE song_title_key(title) = 'bedroom posters'"
+        ).fetchall()
+        assert len(dracula) == 1
+        assert dracula[0][3] == "audfprint"
+        assert dracula[0][4] is not None
+        assert len(bedroom) == 1
+        assert bedroom[0][3] == "audfprint"
+        assert bedroom[0][4] is not None
+        fun = conn.execute(
+            "SELECT id, artist, title, source, audfprint_track_id FROM songs "
+            "WHERE song_artist_key(artist, title) = 'fun.' AND song_title_key(title) = 'we are young'"
+        ).fetchall()
+        assert len(fun) == 1
+        assert fun[0][3] == "audfprint"
+        assert fun[0][4] is not None
+    finally:
+        store.close()
+
+
 def test_promote_recognises_underscore_filename_artifact_as_already_in_tracklist(
     tmp_path: Path,
 ) -> None:
