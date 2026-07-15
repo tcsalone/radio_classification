@@ -40,6 +40,13 @@ gpu = [
   # though we never call the nvcc compiler ourselves.
   "nvidia-cuda-nvcc-cu12>=12.0",
 ]
+mlx = [
+  # Apple Silicon only: runs Whisper on the Metal GPU/ANE via MLX, enabling
+  # larger models (e.g. large-v3-turbo) far faster than faster-whisper's
+  # CPU-only path on macOS. Pulls `mlx` transitively. Do NOT add to core
+  # `dependencies` — it is unavailable on Linux/CI.
+  "mlx-whisper>=0.4.0",
+]
 fingerprint = [
   # audfprint is not packaged for pip (PyPI or direct Git).
   # Install it as an external CLI tool; see README "Install audfprint".

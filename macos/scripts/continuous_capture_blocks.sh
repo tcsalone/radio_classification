@@ -33,8 +33,10 @@ Environment:
   RUN_ID=continuous_my_test
   APPEND_DB=data/store/broadcast.db
   RADIO_CLASSIFIER_OLLAMA_HOST=http://127.0.0.1:11434
-  WHISPER_DEVICE=cpu
-  WHISPER_COMPUTE_TYPE=int8
+  WHISPER_BACKEND=mlx              # 'mlx' (Apple Metal) or 'faster-whisper' (CPU)
+  WHISPER_MODEL=mlx-community/whisper-large-v3-turbo
+  WHISPER_DEVICE=cpu              # faster-whisper only (ignored by mlx)
+  WHISPER_COMPUTE_TYPE=int8       # faster-whisper only (ignored by mlx)
 EOF
 }
 
@@ -75,9 +77,16 @@ BLOCK_SECONDS="${BLOCK_SECONDS:-1800}"
 FREQUENCY="${FREQUENCY:-105300000}"
 DEVICE_INDEX="${DEVICE_INDEX:-0}"
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
+WHISPER_BACKEND="${WHISPER_BACKEND:-faster-whisper}"
+WHISPER_MODEL="${WHISPER_MODEL:-medium.en}"
 WHISPER_DEVICE="${WHISPER_DEVICE:-cpu}"
 WHISPER_COMPUTE_TYPE="${WHISPER_COMPUTE_TYPE:-int8}"
 TOTAL_SECONDS=$((BLOCK_COUNT * BLOCK_SECONDS))
+# Hard ceiling on how long the consumer waits for a block's sidecar before
+# skipping it. Bounds the wait so a stalled/partial capture (no sidecar) can
+# never hang an unattended 24h run. 1.5x block gives margin for the final
+# block, which only completes when capture reaches its duration limit.
+BLOCK_DEADLINE=$((BLOCK_SECONDS * 3 / 2))
 
 STALL_TIMEOUT="${STALL_TIMEOUT:-180}"
 STALL_POLL="${STALL_POLL:-30}"
@@ -123,6 +132,8 @@ echo "total_seconds=$TOTAL_SECONDS"
 echo "capture_log=$CAPTURE_LOG"
 echo "skips_log=$SKIPS_LOG"
 echo "tier3_llm=$RADIO_CLASSIFIER_OLLAMA_HOST"
+echo "whisper_backend=$WHISPER_BACKEND"
+echo "whisper_model=$WHISPER_MODEL"
 echo "whisper_device=$WHISPER_DEVICE"
 echo "whisper_compute_type=$WHISPER_COMPUTE_TYPE"
 
@@ -172,7 +183,10 @@ PY
 }
 
 wait_for_sidecar() {
+  # Returns: 0 sidecar ready | 1 capture process ended first | 2 timed out.
   local sidecar="$1"
+  local deadline="${2:-0}"
+  local waited=0
   while [[ ! -s "$sidecar" ]]; do
     if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
       if [[ ! -s "$sidecar" ]]; then
@@ -180,7 +194,12 @@ wait_for_sidecar() {
         return 1
       fi
     fi
+    if [[ "$deadline" -gt 0 && "$waited" -ge "$deadline" ]]; then
+      echo "wait_for_sidecar: TIMEOUT after ${waited}s waiting for $sidecar" >&2
+      return 2
+    fi
     sleep 2
+    waited=$((waited + 2))
   done
 }
 
@@ -227,11 +246,21 @@ for i in $(seq 1 "$BLOCK_COUNT"); do
   echo
   echo "=== block ${i}/${BLOCK_COUNT} wait for captured chunk ==="
   echo "sidecar=$sidecar"
-  if ! wait_for_sidecar "$sidecar"; then
-    CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
-    echo "block ${i}: capture chunk missing; skipping classify" | tee -a "$SKIPS_LOG" >&2
-    continue
-  fi
+  sidecar_rc=0
+  wait_for_sidecar "$sidecar" "$BLOCK_DEADLINE" || sidecar_rc=$?
+  case "$sidecar_rc" in
+    0) : ;;  # sidecar ready
+    2)
+      CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
+      echo "block ${i}: sidecar not ready within ${BLOCK_DEADLINE}s; skipping, continuing run" | tee -a "$SKIPS_LOG" >&2
+      continue
+      ;;
+    *)
+      CLASSIFY_FAILED=$((CLASSIFY_FAILED + 1))
+      echo "block ${i}: capture chunk missing; skipping classify" | tee -a "$SKIPS_LOG" >&2
+      continue
+      ;;
+  esac
 
   wav_path="$(metadata_value "$sidecar" wav_path)"
   capture_start_utc="$(metadata_value "$sidecar" capture_start_utc)"
@@ -255,6 +284,8 @@ for i in $(seq 1 "$BLOCK_COUNT"); do
   if .venv/bin/python -m radio_classifier classify \
       -i "$wav_path" \
       --capture-start-utc "$capture_start_utc" \
+      --whisper-backend "$WHISPER_BACKEND" \
+      --whisper-model "$WHISPER_MODEL" \
       --whisper-device "$WHISPER_DEVICE" \
       --whisper-compute-type "$WHISPER_COMPUTE_TYPE" \
       --enable-shazam \
@@ -264,6 +295,14 @@ for i in $(seq 1 "$BLOCK_COUNT"); do
       --progress \
       2>&1 | tee "$cls_log"; then
     COMPLETED=$((COMPLETED + 1))
+    # Bound peak disk during a long run: drop this chunk's WAV immediately once
+    # it is classified+persisted (keep the JSON sidecar for audit). Only prune a
+    # COMPLETE chunk — never a partial one. Without this, 48 kHz mono WAVs
+    # accumulate at ~345 MB/hr (~8.3 GB/24h) since retention only frees >7-day files.
+    if [[ "$complete" == "True" || "$complete" == "true" ]]; then
+      rm -f "$wav_path" && echo "pruned classified wav: $wav_path"
+    fi
+    # Safety net for any older/partial WAVs left behind (retention-based).
     if [[ -x scripts/prune_old_wavs.sh ]]; then
       RETENTION_DAYS="${RETENTION_DAYS:-7}" scripts/prune_old_wavs.sh data/captures || true
     fi

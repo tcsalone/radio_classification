@@ -173,6 +173,45 @@ def check_whisper_tiny_cuda_smoke() -> CheckResult:
     return CheckResult("faster-whisper GPU smoke", True, detail)
 
 
+def check_mlx_whisper_smoke() -> CheckResult:
+    """Run a 0.5-second sine through mlx-whisper (Apple Metal) to verify the path.
+
+    Uses ``whisper-tiny`` so first-run download is small. Confirms the mlx
+    backend is importable and can load + run a model on this machine.
+    """
+    try:
+        import numpy as np
+
+        import mlx_whisper  # type: ignore
+    except ImportError as e:
+        return CheckResult(
+            "mlx-whisper smoke",
+            False,
+            f"{e} | Fix: pip install -e '.[mlx]' (Apple Silicon only).",
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wav_path = Path(tmp) / "smoke.wav"
+        rate = 16_000
+        seconds = 0.5
+        t = np.linspace(0, seconds, int(rate * seconds), endpoint=False, dtype=np.float32)
+        sine = (np.sin(2 * np.pi * 440.0 * t) * 0.2 * 32767.0).astype("<i2")
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(sine.tobytes())
+        try:
+            mlx_whisper.transcribe(
+                str(wav_path),
+                path_or_hf_repo="mlx-community/whisper-tiny",
+                language="en",
+            )
+        except Exception as e:  # noqa: BLE001
+            return CheckResult("mlx-whisper smoke", False, str(e)[:500])
+    return CheckResult("mlx-whisper smoke", True, "mlx-community/whisper-tiny on Metal")
+
+
 def check_ollama_tags(base_url: str | None = None) -> CheckResult:
     raw = base_url or os.environ.get(
         "RADIO_CLASSIFIER_OLLAMA_HOST", "http://127.0.0.1:11434"
@@ -205,6 +244,11 @@ def run_checks(*, with_gpu: bool, with_ollama: bool) -> list[CheckResult]:
     ]
     if is_macos():
         checks.append(check_macos_stack())
+        # On Apple Silicon the STT path is mlx-whisper on Metal (not CUDA).
+        # Smoke-test it when that backend is selected so validate.sh catches a
+        # broken mlx install before a long capture.
+        if os.environ.get("WHISPER_BACKEND") == "mlx":
+            checks.append(check_mlx_whisper_smoke())
         if with_gpu:
             checks.append(
                 CheckResult(

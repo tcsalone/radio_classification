@@ -218,16 +218,30 @@ def _add_funnel_arguments(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--whisper-backend",
+        type=str,
+        choices=("faster-whisper", "mlx"),
+        default=os.environ.get("WHISPER_BACKEND", "faster-whisper"),
+        help=(
+            "Speech backend: 'faster-whisper' (CPU/CUDA) or 'mlx' (Apple Metal, "
+            "Apple Silicon only). Default from $WHISPER_BACKEND or faster-whisper."
+        ),
+    )
+    p.add_argument(
         "--whisper-model",
         type=str,
-        default="medium.en",
-        help="faster-whisper model size or path (default: medium.en)",
+        default=os.environ.get("WHISPER_MODEL", "medium.en"),
+        help=(
+            "Model size/path (faster-whisper) or HF repo/path (mlx, e.g. "
+            "mlx-community/whisper-large-v3-turbo). Default from $WHISPER_MODEL "
+            "or medium.en."
+        ),
     )
     p.add_argument(
         "--whisper-device",
         type=str,
         default="cuda",
-        help="Device for faster-whisper (default: cuda)",
+        help="Device for faster-whisper (default: cuda; ignored by mlx backend)",
     )
     p.add_argument(
         "--whisper-compute-type",
@@ -1026,10 +1040,12 @@ def _build_funnel(args: argparse.Namespace) -> "FunnelBundle":
     tier3 = None
     if not args.no_tier3:
         try:
-            from radio_classifier.speech import OllamaSpeechClassifier, WhisperTranscriber, run_speech_pipeline
+            from radio_classifier.speech import OllamaSpeechClassifier, build_transcriber, run_speech_pipeline
 
-            transcriber = WhisperTranscriber(
+            transcriber = build_transcriber(
+                backend=args.whisper_backend,
                 model_size=args.whisper_model,
+                model=args.whisper_model,
                 device=args.whisper_device,
                 compute_type=args.whisper_compute_type,
                 language=args.whisper_language,

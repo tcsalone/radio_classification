@@ -264,6 +264,14 @@ class BroadcastStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         if use_wal:
             self._conn.execute("PRAGMA journal_mode=WAL")
+        # DEFERRED (parallel classify workers): WAL already allows one writer +
+        # concurrent readers, but there is no busy_timeout, so a second writer
+        # process would fail immediately with SQLITE_BUSY. Before running a
+        # multi-worker classify pool over the {run_id}_block{NNNN} WAV queue
+        # (see macos/scripts/continuous_capture_blocks.sh consumer loop), add:
+        #     self._conn.execute("PRAGMA busy_timeout=5000")
+        # to serialize the brief per-window write commits. Left unset now because
+        # the phased 24h path is single-consumer.
         self._migrate_schema()
         self._conn.commit()
 

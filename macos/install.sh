@@ -36,7 +36,12 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 pip install -U pip setuptools wheel
-pip install -e ".[acoustic,shazam,seeding,dev]"
+# mlx-whisper (Apple Metal STT backend) is Apple-Silicon only; include it there.
+if [[ "$(uname -m)" == "arm64" ]]; then
+  pip install -e ".[acoustic,shazam,seeding,dev,mlx]"
+else
+  pip install -e ".[acoustic,shazam,seeding,dev]"
+fi
 
 echo "=== audfprint (external CLI) ==="
 AUDFPRINT_DIR="${HOME}/dev/audfprint"

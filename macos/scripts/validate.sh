@@ -52,6 +52,8 @@ echo "=== Step 5: classify smoke chunk ==="
 .venv/bin/python -m radio_classifier classify \
   -i "$WAV" \
   --capture-start-utc "$START" \
+  --whisper-backend "${WHISPER_BACKEND:-faster-whisper}" \
+  --whisper-model "${WHISPER_MODEL:-medium.en}" \
   --whisper-device "${WHISPER_DEVICE:-cpu}" \
   --whisper-compute-type "${WHISPER_COMPUTE_TYPE:-int8}" \
   --enable-shazam \
