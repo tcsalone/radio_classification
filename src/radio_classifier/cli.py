@@ -855,6 +855,21 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply the merges. Without this flag the command is read-only.",
     )
+    commercials_merge_brands = commercials_sub.add_parser(
+        "merge-brands",
+        help="Fold duplicate brand rows for the same advertiser (case/alias variants).",
+    )
+    commercials_merge_brands.add_argument("--db-path", type=Path, default=None)
+    commercials_merge_brands.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the merge plan without modifying the DB (default).",
+    )
+    commercials_merge_brands.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the brand merge. Without this flag the command is read-only.",
+    )
 
     return p
 
@@ -2328,6 +2343,58 @@ def cmd_commercials_dedupe(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_commercials_merge_brands(args: argparse.Namespace) -> int:
+    from radio_classifier.commercials import merge_brands
+
+    db_path = _resolve_db_path(args.db_path)
+    if not db_path.exists():
+        print(
+            f"radio-classifier commercials merge-brands: db not found: {db_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    dry_run = True if args.dry_run else not args.apply
+    with BroadcastStore(db_path) as store:
+        report = merge_brands(store, dry_run=dry_run)
+
+    if not report.groups:
+        print("radio-classifier: no duplicate brand groups found", file=sys.stderr)
+        return 0
+
+    verb = "would fold" if report.dry_run else "folded"
+    print(
+        f"radio-classifier: {verb} {report.collapsed_pairs} duplicate brand row(s) "
+        f"across {len(report.groups)} advertiser(s)",
+        file=sys.stderr,
+    )
+    for group in report.groups:
+        survivor = group.survivor
+        print(
+            f"  → {group.display_name!r} (keep brand_id={survivor.brand_id}, "
+            f"{survivor.total_refs} ref(s))",
+            file=sys.stderr,
+        )
+        for loser in group.losers:
+            print(
+                f"    fold brand_id={loser.brand_id} {loser.canonical_name!r} "
+                f"({loser.event_count} event(s), {loser.commercial_count} ad(s), "
+                f"{loser.mention_count} mention(s))",
+                file=sys.stderr,
+            )
+
+    if not report.dry_run:
+        print(
+            f"\nradio-classifier: re-pointed {report.events_repointed} broadcast_events row(s), "
+            f"{report.mentions_repointed} brand mention(s), "
+            f"{report.commercials_repointed} commercial(s) "
+            f"(merged {report.commercials_merged} duplicate ad(s)); "
+            f"deleted {report.brands_deleted} brand row(s)",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_commercials_backfill_brands(args: argparse.Namespace) -> int:
     from radio_classifier.commercials import backfill_unbranded_commercials
     from radio_classifier.reports import parse_since
@@ -2508,6 +2575,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return cmd_commercials_backfill_brands(args)
             if args.commercials_command == "merge-boundaries":
                 return cmd_commercials_merge_boundaries(args)
+            if args.commercials_command == "merge-brands":
+                return cmd_commercials_merge_brands(args)
             return 2
         return 1
     except _CliConfigError as exc:

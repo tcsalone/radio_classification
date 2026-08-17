@@ -6,6 +6,12 @@ from radio_classifier.commercials.backfill import (
     backfill_unbranded_commercials,
 )
 from radio_classifier.commercials.brand_extract import extract_brand_from_text
+from radio_classifier.commercials.brand_merge import (
+    BrandMergeGroup,
+    BrandMergeMember,
+    BrandMergeReport,
+    merge_brands,
+)
 from radio_classifier.commercials.dedupe import (
     CommercialDedupeGroup,
     CommercialDedupeMember,
@@ -29,6 +35,9 @@ __all__ = [
     "BoundaryMergeReport",
     "BrandBackfillItem",
     "BrandBackfillReport",
+    "BrandMergeGroup",
+    "BrandMergeMember",
+    "BrandMergeReport",
     "CommercialDedupeGroup",
     "CommercialDedupeMember",
     "CommercialDedupeReport",
@@ -40,4 +49,5 @@ __all__ = [
     "dedupe_commercials",
     "extract_brand_from_text",
     "merge_boundary_commercials",
+    "merge_brands",
 ]
