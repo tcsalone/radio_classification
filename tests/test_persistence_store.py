@@ -276,13 +276,14 @@ def test_upsert_song_collapses_shazam_then_audfprint_into_one_row(tmp_path: Path
 
 
 def test_upsert_song_folds_feature_suffix_punctuation_drift(tmp_path: Path) -> None:
-    """Shazam's '(feat. X)' parens and the audfprint filename's '_feat. X'
-    underscore are the SAME recording and must resolve to one row, while a
-    plain title with no feature credit stays distinct.
+    """Shazam's '(feat. X)' parens, the audfprint filename's '_feat. X'
+    underscore, AND the plain base title all resolve to ONE song row.
 
-    Mirrors the Yellowcard 'Bedroom Posters' rows observed in the live DB:
-    id 82 (shazam, parens) and id 224 (audfprint, underscore) were two rows for
-    one recording, fragmenting the play log.
+    The feature/remix qualifier is dropped from the identity key so every
+    format variant of the same recording collapses. Confirmed against the live
+    DB: the Yellowcard 'Bedroom Posters' reference files (with and without the
+    'feat. Good Charlotte' credit) were byte-identical — the same recording —
+    so keeping them as separate rows only fragmented the play log.
     """
     db = tmp_path / "rc.db"
     with BroadcastStore(db) as store:
@@ -301,19 +302,19 @@ def test_upsert_song_folds_feature_suffix_punctuation_drift(tmp_path: Path) -> N
             "parens vs underscore feature credit must be one song"
         )
 
-        # The non-feature base recording must remain a separate row.
+        # The plain base title folds into the same recording's row.
         base = store.upsert_song(
             artist="Yellowcard",
             title="Bedroom Posters",
             audfprint_track_id="data/reference/songs/Yellowcard - Bedroom Posters.mp3",
             source="audfprint",
         )
-        assert base != shazam_feat, "feat version and base version stay distinct"
+        assert base == shazam_feat, "base and feat-credit variants are one song"
 
         n = store.connection.execute(
             "SELECT COUNT(*) FROM songs WHERE artist = 'Yellowcard'"
         ).fetchone()[0]
-        assert n == 2
+        assert n == 1
 
 
 def test_upsert_song_is_case_insensitive(tmp_path: Path) -> None:

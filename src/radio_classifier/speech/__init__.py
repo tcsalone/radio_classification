@@ -10,7 +10,12 @@ from radio_classifier.speech.ollama import (
     OllamaSpeechClassifier,
 )
 from radio_classifier.speech.pipeline import run_speech_pipeline
-from radio_classifier.speech.transcribe import WhisperTranscriber, transcribe_window
+from radio_classifier.speech.transcribe import (
+    MlxWhisperTranscriber,
+    WhisperTranscriber,
+    build_transcriber,
+    transcribe_window,
+)
 from radio_classifier.speech.types import (
     BrandMention,
     CommercialSignature,
@@ -24,6 +29,7 @@ __all__ = [
     "BrandMention",
     "CommercialSignature",
     "LlmClassificationJson",
+    "MlxWhisperTranscriber",
     "OllamaClassificationError",
     "OllamaSpeechClassifier",
     "SpeechPipelineResult",
@@ -31,6 +37,7 @@ __all__ = [
     "SpeechTranscriptResult",
     "TranscribeStatus",
     "WhisperTranscriber",
+    "build_transcriber",
     "format_speech_human",
     "format_speech_json",
     "run_speech_pipeline",

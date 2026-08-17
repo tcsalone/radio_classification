@@ -2,8 +2,17 @@
 
 ## HIGH PRIORITY
 
-### [ ] Capture supervisor watchdog for "stuck-but-alive" capture hangs
-**Added:** 2026-06-09 · **Priority:** HIGH · **Status:** to plan + build
+### [~] Capture supervisor watchdog for "stuck-but-alive" capture hangs
+**Added:** 2026-06-09 · **Priority:** HIGH · **Status:** partially done (macOS)
+
+**Update 2026-07-15 (macOS fork):** `macos/scripts/continuous_capture_blocks.sh`
+now has both safety nets: the stall watchdog (kills a capture whose WAV stops
+growing) *and* a bounded `wait_for_sidecar` with a per-block hard deadline
+(`BLOCK_DEADLINE = block_seconds * 1.5`, proposal items 1 + 4) — a missing/partial
+sidecar now skips the block and drains the run instead of hanging. Covered by
+`tests/test_macos_continuous_capture.py::test_missing_sidecar_times_out_without_hanging`.
+Still open: partial-WAV flush→classify (items 2/3) and porting the deadline to the
+Linux/WSL `scripts/continuous_capture_blocks.sh`.
 
 **Problem**
 During the 2026-06-08 48h run (`capture_run_id=448`), the pipeline silently
